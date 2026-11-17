@@ -11,6 +11,12 @@ A tiny, read-only document viewer for Windows. One small exe, no installer, no d
 
 Download `word-viewer.exe` from [Releases](../../releases), then open a document with **File → Open** (Ctrl+O), drag one onto the window, or use **Open with** on a file.
 
+- Find: Ctrl+F, then F3 / Shift+F3 for the next / previous match
+- Zoom: Ctrl+Plus, Ctrl+Minus, Ctrl+0 (or Ctrl+mouse wheel)
+- Print: Ctrl+P
+
+The window remembers its size, position and zoom in `%LOCALAPPDATA%\word-viewer\window.txt`; nothing about the documents you open is stored.
+
 Releases are built by GitHub Actions from the tagged source. To check that an exe is genuine:
 
 ```

@@ -45,7 +45,7 @@ jobs:
       - name: Check DLL imports
         run: |
           objdump -p word-viewer.exe | awk '/DLL Name:/ {print $3}' | tee imports.txt
-          bad=$(grep -viE '^(kernel32|user32|shell32|comdlg32|ntdll)\.dll$|^api-ms-win-' imports.txt || true)
+          bad=$(grep -viE '^(kernel32|user32|gdi32|shell32|comdlg32|ntdll)\.dll$|^api-ms-win-' imports.txt || true)
           if [ -n "$bad" ]; then echo "::error::DLL imports that could be planted: $bad"; exit 1; fi
 
   release:
