@@ -33,6 +33,7 @@ Documents are untrusted input, so the viewer is built to be safe to open them wi
 - **No code paths from documents.** Document text is always escaped before display, so a file cannot inject RTF objects, fields, or links. Macros, embedded objects, and external references are never processed.
 - **Bounded work.** Input (64 MB; 1 GB for PDFs, which are mostly images), decompressed size, and output (32 MB) are capped; zip and PDF compression bombs, cyclic sector chains and page trees, runaway nesting, and overlapping text pieces are rejected.
 - **No DLL planting.** The exe only imports DLLs that Windows always loads from System32 (the C runtime is linked in statically, and CI checks every build), and the RichEdit DLL is loaded from System32 explicitly.
+- **Locked down at startup.** Before opening a document, the viewer puts itself in a job that can't start other programs, and refuses DLLs from network shares or low-integrity files. It's built with Control Flow Guard.
 - **Crash-safe.** Arithmetic overflow is checked in release builds, and any parser failure shows "Could not read this file" instead of crashing.
 - **Tested against hostile input.** `tests/hostile.rs` runs malicious samples on every commit, and `fuzz/` contains a [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) target.
 

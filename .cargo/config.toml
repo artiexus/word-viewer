@@ -2,5 +2,8 @@
 # is not a protected KnownDLL: Windows would look for it next to the exe first
 # (e.g. in Downloads), allowing DLL planting, and it fails on PCs without the
 # Visual C++ redistributable.
+#
+# Control Flow Guard: indirect calls may only go to real function starts, which
+# stops many memory-corruption exploits from redirecting the program.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "control-flow-guard"]

@@ -250,6 +250,19 @@ mod win {
     }
 
     #[repr(C)]
+    struct BasicLimit {
+        per_process_time: i64,
+        per_job_time: i64,
+        flags: u32,
+        min_working_set: usize,
+        max_working_set: usize,
+        active_processes: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
     struct CharFormat {
         size: u32,
         mask: u32,
@@ -344,6 +357,11 @@ mod win {
     #[link(name = "kernel32")]
     extern "system" {
         fn SetDefaultDllDirectories(flags: u32) -> i32;
+        fn SetProcessMitigationPolicy(policy: i32, buf: *const c_void, len: usize) -> i32;
+        fn GetCurrentProcess() -> isize;
+        fn CreateJobObjectW(attrs: *const c_void, name: *const u16) -> isize;
+        fn SetInformationJobObject(job: isize, class: i32, info: *const c_void, len: u32) -> i32;
+        fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
         fn LoadLibraryExW(name: *const u16, file: isize, flags: u32) -> isize;
         fn GetModuleHandleW(name: *const u16) -> isize;
         fn GetProcAddress(module: isize, name: *const u8) -> *const c_void;
@@ -2620,6 +2638,30 @@ mod win {
         }
     }
 
+    /// Limit what the viewer can do if a document ever took control of it.
+    /// Each step is best effort: if Windows refuses one, the viewer still runs.
+    unsafe fn lock_down() {
+        // No DLLs from network shares or from low-integrity files; System32 first.
+        let image_load: u32 = 0x1 | 0x2 | 0x4; // NoRemoteImages | NoLowMandatoryLabelImages | PreferSystem32Images
+        SetProcessMitigationPolicy(10, &image_load as *const _ as *const c_void, 4); // ProcessImageLoadPolicy
+
+        // No child processes: a job allowing only this one.
+        let job = CreateJobObjectW(null(), null());
+        if job != 0 {
+            let mut limit: BasicLimit = std::mem::zeroed();
+            limit.flags = 0x8; // JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            limit.active_processes = 1;
+            if SetInformationJobObject(job, 2, &limit as *const _ as *const c_void, std::mem::size_of::<BasicLimit>() as u32) != 0 {
+                AssignProcessToJobObject(job, GetCurrentProcess());
+            }
+            // the job stays open while this process is in it
+        }
+        // Not done: running at low integrity. It would keep a hijacked viewer
+        // from changing the user's files, but it also stops "Print to PDF"
+        // from saving anywhere but LocalLow. That needs the parsing moved to
+        // a separate low-integrity process instead.
+    }
+
     pub fn run() {
         unsafe {
             // Only load DLLs from System32, never from the exe's folder (e.g. Downloads).
@@ -2628,6 +2670,8 @@ mod win {
             if LoadLibraryExW(wide("Msftedit.dll").as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32) == 0 {
                 return;
             }
+            // Before any document is opened.
+            lock_down();
             FIND_MSG.store(RegisterWindowMessageW(wide("commdlg_FindReplace").as_ptr()), Ordering::Relaxed);
             let inst = GetModuleHandleW(null());
             let class = wide("WordViewer");
