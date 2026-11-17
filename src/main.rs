@@ -319,6 +319,10 @@ mod win {
         fn GetMenuItemCount(menu: isize) -> i32;
         fn GetMenuItemInfoW(menu: isize, item: u32, by_position: i32, mi: *mut MenuItemInfo) -> i32;
         fn SetMenu(h: Hwnd, menu: isize) -> i32;
+        fn DialogBoxIndirectParamW(inst: isize, template: *const c_void, parent: Hwnd, proc_: unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize, init: isize) -> isize;
+        fn EndDialog(dlg: Hwnd, result: isize) -> i32;
+        fn GetDlgItem(dlg: Hwnd, id: i32) -> Hwnd;
+        fn InvalidateRect(h: Hwnd, r: *const Rect, erase: i32) -> i32;
         fn GetClassNameW(h: Hwnd, name: *mut u16, n: i32) -> i32;
         fn GetClientRect(h: Hwnd, r: *mut Rect) -> i32;
         fn ClientToScreen(h: Hwnd, pt: *mut i32) -> i32;
@@ -411,10 +415,12 @@ mod win {
     const ID_ZOOM_OUT: usize = 10;
     const ID_ZOOM_RESET: usize = 11;
     const ID_DARK: usize = 12;
-    const ID_DARK_TEXT: usize = 13;
-    const ID_DARK_BG: usize = 14;
-    const ID_DARK_RESET: usize = 15;
-    const ID_DARK_FOLLOW: usize = 16;
+    const ID_PREFS: usize = 13;
+    /// Text sizes offered, in points; and weights, as Segoe UI faces.
+    const SIZES: [u32; 10] = [9, 10, 11, 12, 13, 14, 16, 18, 20, 24];
+    const WEIGHTS: [(&str, &str); 4] = [("Light", "Segoe UI Light"), ("Semilight", "Segoe UI Semilight"), ("Regular", "Segoe UI"), ("Semibold", "Segoe UI Semibold")];
+    const DEFAULT_SIZE: u32 = 11;
+    const DEFAULT_WEIGHT: u32 = 2;
     /// Dark mode colors (COLORREF, 0x00BBGGRR): Windows Terminal's default
     /// "Campbell" scheme, background #0C0C0C and text #CCCCCC.
     const DARK_BG: u32 = 0x000C_0C0C;
@@ -432,6 +438,8 @@ mod win {
     static DARK: AtomicBool = AtomicBool::new(false);
     /// Dark mode follows Windows' app mode until the user picks one.
     static FOLLOW_WINDOWS: AtomicBool = AtomicBool::new(true);
+    static TEXT_SIZE: AtomicU32 = AtomicU32::new(DEFAULT_SIZE);
+    static TEXT_WEIGHT: AtomicU32 = AtomicU32::new(DEFAULT_WEIGHT);
     static DARK_TEXT_COLOR: AtomicU32 = AtomicU32::new(DARK_TEXT);
     static DARK_BG_COLOR: AtomicU32 = AtomicU32::new(DARK_BG);
     static VIEW_MENU: AtomicIsize = AtomicIsize::new(0);
@@ -477,6 +485,8 @@ mod win {
         dark: Option<bool>,
         /// Dark mode's text and background colors.
         colors: Option<(u32, u32)>,
+        /// Text size in points, and weight (an index into WEIGHTS).
+        text: Option<(u32, u32)>,
     }
 
     fn load_settings() -> Option<Settings> {
@@ -486,7 +496,7 @@ mod win {
         let &[l, t, r, b, max, zoom] = v.get(..6)? else { return None };
         let [l, t, r, b] = [l, t, r, b].map(|x| x.clamp(-100_000, 100_000) as i32);
         // later fields were added over time: dark mode (0 follow Windows,
-        // 1 dark, 2 light), then its colors
+        // 1 dark, 2 light), its colors, then text size and weight
         let dark = match v.get(6) {
             Some(1) => Some(true),
             Some(2) => Some(false),
@@ -496,8 +506,12 @@ mod win {
             Some(&[fg, bg]) => Some(((fg & 0xFF_FFFF) as u32, (bg & 0xFF_FFFF) as u32)),
             _ => None,
         };
+        let text = match v.get(9..11) {
+            Some(&[size, weight]) => Some((size.clamp(6, 72) as u32, weight.clamp(0, WEIGHTS.len() as i64 - 1) as u32)),
+            _ => None,
+        };
         let ok = r - l >= 200 && b - t >= 150 && r - l <= 32767 && b - t <= 32767;
-        ok.then_some(Settings { normal: Rect { left: l, top: t, right: r, bottom: b }, maximized: max != 0, zoom: zoom.clamp(10, 500) as u32, dark, colors })
+        ok.then_some(Settings { normal: Rect { left: l, top: t, right: r, bottom: b }, maximized: max != 0, zoom: zoom.clamp(10, 500) as u32, dark, colors, text })
     }
 
     fn save_settings() {
@@ -513,7 +527,8 @@ mod win {
             (false, false) => 2,
         };
         let (fg, bg) = (DARK_TEXT_COLOR.load(Ordering::Relaxed), DARK_BG_COLOR.load(Ordering::Relaxed));
-        let line = format!("{} {} {} {} {} {} {dark} {fg} {bg}\n", n.left, n.top, n.right, n.bottom, (wp.show_cmd == 3) as u8, zoom());
+        let (size, weight) = (TEXT_SIZE.load(Ordering::Relaxed), TEXT_WEIGHT.load(Ordering::Relaxed));
+        let line = format!("{} {} {} {} {} {} {dark} {fg} {bg} {size} {weight}\n", n.left, n.top, n.right, n.bottom, (wp.show_cmd == 3) as u8, zoom());
         if let Some(path) = settings_path() {
             let _ = path.parent().map(std::fs::create_dir_all);
             let _ = std::fs::write(path, line);
@@ -522,8 +537,49 @@ mod win {
 
     // ---- showing documents ----
 
+    /// The document as the library rendered it, to show again when the text
+    /// preferences change.
+    static SHOWN_RTF: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+    /// `rtf` with the text preferences applied: font sizes scaled from the
+    /// default 11 pt, and the weight's face in the font table. Reads the RTF
+    /// this crate writes, where document text is escaped (\\, \{, \}), so
+    /// only real control words are changed.
+    fn with_text_prefs(rtf: &str) -> String {
+        let (size, weight) = (TEXT_SIZE.load(Ordering::Relaxed), TEXT_WEIGHT.load(Ordering::Relaxed) as usize);
+        let face = WEIGHTS.get(weight).map_or("Segoe UI", |w| w.1);
+        let mut out = String::with_capacity(rtf.len() + 64);
+        let b = rtf.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\\' {
+                match b.get(i + 1) {
+                    Some(b'f') if b.get(i + 2) == Some(&b's') && b.get(i + 3).is_some_and(|c| c.is_ascii_digit()) => {
+                        let digits = b[i + 3..].iter().take_while(|c| c.is_ascii_digit()).count();
+                        let half_points: u32 = rtf[i + 3..i + 3 + digits].parse::<u32>().unwrap_or(22).min(3276);
+                        out.push_str(&format!("\\fs{}", (half_points * size + DEFAULT_SIZE / 2) / DEFAULT_SIZE));
+                        i += 3 + digits;
+                        continue;
+                    }
+                    Some(&c) => {
+                        // an escape (\\ \{ \}) or another control word: copy its first two bytes
+                        out.push('\\');
+                        out.push(c as char);
+                        i += 2;
+                        continue;
+                    }
+                    None => {}
+                }
+            }
+            out.push(b[i] as char); // RTF output is pure ASCII
+            i += 1;
+        }
+        out.replacen("{\\f0 Segoe UI;}", &format!("{{\\f0 {face};}}"), 1)
+    }
+
     fn show_rtf(rtf: &str) {
-        let mut buf = rtf.as_bytes().to_vec(); // RTF output is pure ASCII
+        *SHOWN_RTF.lock().unwrap_or_else(|e| e.into_inner()) = rtf.to_string();
+        let mut buf = with_text_prefs(rtf).into_bytes();
         buf.push(0);
         let st = SetTextEx { flags: 0, codepage: 0 };
         let z = zoom(); // replacing the text resets RichEdit's zoom
@@ -537,6 +593,19 @@ mod win {
             text_color(Some(DARK_TEXT_COLOR.load(Ordering::Relaxed)));
         }
         set_zoom(z);
+    }
+
+    /// Show the current document again (after the text preferences change),
+    /// keeping the same text at the top of the window.
+    fn reshow() {
+        unsafe {
+            let line = SendMessageW(edit(), 0x00CE, 0, 0); // EM_GETFIRSTVISIBLELINE
+            let at = SendMessageW(edit(), 0x00BB, line as usize, 0); // EM_LINEINDEX
+            let rtf = SHOWN_RTF.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            show_rtf(&rtf);
+            let line = SendMessageW(edit(), 0x0436, 0, at); // EM_EXLINEFROMCHAR
+            SendMessageW(edit(), 0x00B6, 0, line); // EM_LINESCROLL
+        }
     }
 
     fn read_limited(path: &std::path::Path) -> Option<Vec<u8>> {
@@ -668,9 +737,7 @@ mod win {
                 let info = MenuInfo { size: std::mem::size_of::<MenuInfo>() as u32, mask: 0x2 | 0x8000_0000, back: brush, ..std::mem::zeroed() }; // MIM_BACKGROUND | MIM_APPLYTOSUBMENUS
                 SetMenuInfo(bar, &info);
             }
-            let follow = FOLLOW_WINDOWS.load(Ordering::Relaxed);
             CheckMenuItem(VIEW_MENU.load(Ordering::Relaxed), ID_DARK as u32, if dark { 0x8 } else { 0 }); // MF_CHECKED
-            CheckMenuItem(VIEW_MENU.load(Ordering::Relaxed), ID_DARK_FOLLOW as u32, if follow { 0x8 } else { 0 });
             SetMenu(win, bar);
             if old_menu != 0 {
                 DestroyMenu(old_menu);
@@ -690,8 +757,7 @@ mod win {
         ("&Edit", &[("&Copy\tCtrl+C", ID_COPY), ("Select &All\tCtrl+A", ID_SELECT_ALL), ("", 0), ("&Find...\tCtrl+F", ID_FIND), ("Find &Next\tF3", ID_FIND_NEXT), ("Find Pre&vious\tShift+F3", ID_FIND_PREV)]),
         ("&View", &[
             ("Zoom &In\tCtrl++", ID_ZOOM_IN), ("Zoom &Out\tCtrl+-", ID_ZOOM_OUT), ("&Actual Size\tCtrl+0", ID_ZOOM_RESET), ("", 0),
-            ("&Dark Mode\tCtrl+D", ID_DARK), ("Dark Mode: &Match Windows", ID_DARK_FOLLOW),
-            ("Dark Mode &Text Color...", ID_DARK_TEXT), ("Dark Mode &Background Color...", ID_DARK_BG), ("&Reset Dark Mode Colors", ID_DARK_RESET),
+            ("&Dark Mode\tCtrl+D", ID_DARK), ("&Text Preferences...", ID_PREFS),
         ]),
     ];
 
@@ -982,22 +1048,208 @@ mod win {
         r
     }
 
-    /// Let the user pick a dark mode color (text or background), then show dark mode with it.
-    fn pick_color(color: &AtomicU32) {
+    /// The standard color dialog, starting at `color`; the chosen color, if any.
+    fn choose_color(owner: Hwnd, color: u32) -> Option<u32> {
         let mut custom = [0x00FF_FFFFu32; 16];
         custom[0] = DARK_TEXT;
         custom[1] = DARK_BG;
         let mut cc: ChooseColor = unsafe { std::mem::zeroed() };
         cc.size = std::mem::size_of::<ChooseColor>() as u32;
-        cc.owner = WIN.load(Ordering::Relaxed);
-        cc.result = color.load(Ordering::Relaxed);
+        cc.owner = owner;
+        cc.result = color;
         cc.custom = custom.as_mut_ptr();
         cc.flags = 0x1 | 0x2; // CC_RGBINIT | CC_FULLOPEN
-        if unsafe { ChooseColorW(&mut cc) } != 0 {
-            color.store(cc.result & 0xFF_FFFF, Ordering::Relaxed);
-            DARK.store(true, Ordering::Relaxed);
-            FOLLOW_WINDOWS.store(false, Ordering::Relaxed);
-            apply_theme();
+        (unsafe { ChooseColorW(&mut cc) } != 0).then_some(cc.result & 0xFF_FFFF)
+    }
+
+    // ---- View > Text Preferences ----
+
+    const IDC_SIZE: u16 = 100;
+    const IDC_WEIGHT: u16 = 101;
+    const IDC_MATCH: u16 = 110;
+    const IDC_LIGHT: u16 = 111;
+    const IDC_DARK: u16 = 112;
+    const IDC_FG_SWATCH: u16 = 120;
+    const IDC_FG: u16 = 121;
+    const IDC_BG_SWATCH: u16 = 122;
+    const IDC_BG: u16 = 123;
+    const IDC_RESET: u16 = 124;
+
+    /// The dark mode colors being edited in the dialog (applied on OK), and
+    /// brushes for their swatches.
+    static EDIT_FG: AtomicU32 = AtomicU32::new(0);
+    static EDIT_BG: AtomicU32 = AtomicU32::new(0);
+    static SWATCHES: [AtomicIsize; 2] = [AtomicIsize::new(0), AtomicIsize::new(0)];
+
+    /// An in-memory dialog template (DLGTEMPLATE and DLGITEMTEMPLATEs), so the
+    /// exe needs no resource script for it.
+    struct Template(Vec<u16>);
+
+    impl Template {
+        fn u32(&mut self, v: u32) {
+            self.0.extend([v as u16, (v >> 16) as u16]);
+        }
+
+        fn str(&mut self, s: &str) {
+            self.0.extend(s.encode_utf16().chain(Some(0)));
+        }
+
+        fn align(&mut self) {
+            if self.0.len() % 2 == 1 {
+                self.0.push(0);
+            }
+        }
+
+        fn new(title: &str, items: u16, cx: i16, cy: i16) -> Template {
+            let mut t = Template(Vec::new());
+            // WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT | DS_CENTER
+            t.u32(0x8000_0000 | 0x00C0_0000 | 0x0008_0000 | 0x80 | 0x40 | 0x800);
+            t.u32(0);
+            t.0.extend([items, 0, 0, cx as u16, cy as u16, 0, 0]); // count, x, y, cx, cy, no menu, default class
+            t.str(title);
+            t.0.push(9); // point size
+            t.str("Segoe UI");
+            t
+        }
+
+        /// A control: `class` is a predefined class atom (0x80 button, 0x82 static, 0x85 combo box).
+        fn item(&mut self, class: u16, style: u32, rect: [i16; 4], id: u16, text: &str) {
+            self.align();
+            self.u32(0x4000_0000 | 0x1000_0000 | style); // WS_CHILD | WS_VISIBLE
+            self.u32(0);
+            self.0.extend(rect.map(|v| v as u16));
+            self.0.extend([id, 0xFFFF, class]);
+            self.str(text);
+            self.0.push(0); // no creation data
+        }
+    }
+
+    fn prefs_dialog() {
+        const BUTTON: u16 = 0x80;
+        const STATIC: u16 = 0x82;
+        const COMBO: u16 = 0x85;
+        const TAB: u32 = 0x0001_0000; // WS_TABSTOP
+        const GROUP: u32 = 0x0002_0000; // WS_GROUP
+        const NONE: u16 = 0xFFFF;
+        let mut t = Template::new("Text Preferences", 20, 230, 188);
+        t.item(BUTTON, 7, [7, 6, 216, 50], NONE, "Text"); // BS_GROUPBOX
+        t.item(STATIC, 0, [16, 21, 44, 9], NONE, "&Size:");
+        t.item(COMBO, 3 | 0x0020_0000 | TAB | GROUP, [62, 19, 50, 140], IDC_SIZE, ""); // CBS_DROPDOWNLIST | WS_VSCROLL
+        t.item(STATIC, 0, [116, 21, 40, 9], NONE, "points");
+        t.item(STATIC, 0, [16, 38, 44, 9], NONE, "&Weight:");
+        t.item(COMBO, 3 | 0x0020_0000 | TAB | GROUP, [62, 36, 80, 100], IDC_WEIGHT, "");
+        t.item(BUTTON, 7, [7, 62, 216, 98], NONE, "Dark mode");
+        t.item(BUTTON, 9 | TAB | GROUP, [16, 77, 66, 10], IDC_MATCH, "&Match Windows"); // BS_AUTORADIOBUTTON
+        t.item(BUTTON, 9, [86, 77, 62, 10], IDC_LIGHT, "Always &light");
+        t.item(BUTTON, 9, [152, 77, 66, 10], IDC_DARK, "Always &dark");
+        t.item(STATIC, GROUP, [16, 98, 70, 9], NONE, "Text color:");
+        t.item(STATIC, 0x1000, [90, 96, 30, 12], IDC_FG_SWATCH, ""); // SS_SUNKEN
+        t.item(BUTTON, TAB | GROUP, [126, 95, 54, 14], IDC_FG, "&Change...");
+        t.item(STATIC, 0, [16, 118, 70, 9], NONE, "Background color:");
+        t.item(STATIC, 0x1000, [90, 116, 30, 12], IDC_BG_SWATCH, "");
+        t.item(BUTTON, TAB, [126, 115, 54, 14], IDC_BG, "C&hange...");
+        t.item(BUTTON, TAB, [16, 138, 70, 14], IDC_RESET, "&Reset colors");
+        t.item(STATIC, 0, [90, 141, 130, 9], NONE, "Ctrl+D also switches dark mode.");
+        t.item(BUTTON, 1 | TAB | GROUP, [117, 168, 50, 14], 1, "OK"); // BS_DEFPUSHBUTTON, IDOK
+        t.item(BUTTON, TAB, [173, 168, 50, 14], 2, "Cancel"); // IDCANCEL
+        // DialogBoxIndirect needs the template DWORD-aligned
+        t.align();
+        let words: Vec<u32> = t.0.chunks(2).map(|c| c[0] as u32 | (c[1] as u32) << 16).collect();
+        unsafe {
+            if DialogBoxIndirectParamW(GetModuleHandleW(null()), words.as_ptr() as *const c_void, WIN.load(Ordering::Relaxed), prefs_proc, 0) == 1 {
+                reshow();
+                apply_theme();
+            }
+            for s in &SWATCHES {
+                let b = s.swap(0, Ordering::Relaxed);
+                if b != 0 {
+                    DeleteObject(b);
+                }
+            }
+        }
+    }
+
+    unsafe fn set_swatch(dlg: Hwnd, i: usize, color: u32) {
+        let old = SWATCHES[i].swap(CreateSolidBrush(color), Ordering::Relaxed);
+        if old != 0 {
+            DeleteObject(old);
+        }
+        InvalidateRect(GetDlgItem(dlg, [IDC_FG_SWATCH, IDC_BG_SWATCH][i] as i32), null(), 1);
+    }
+
+    unsafe extern "system" fn prefs_proc(dlg: Hwnd, m: u32, w: usize, l: isize) -> isize {
+        match m {
+            0x0110 => { // WM_INITDIALOG
+                let item = |id: u16| GetDlgItem(dlg, id as i32);
+                let size = TEXT_SIZE.load(Ordering::Relaxed);
+                for (i, s) in SIZES.iter().enumerate() {
+                    SendMessageW(item(IDC_SIZE), 0x0143, 0, wide(&s.to_string()).as_ptr() as isize); // CB_ADDSTRING
+                    if *s == size {
+                        SendMessageW(item(IDC_SIZE), 0x014E, i, 0); // CB_SETCURSEL
+                    }
+                }
+                for (name, _) in WEIGHTS {
+                    SendMessageW(item(IDC_WEIGHT), 0x0143, 0, wide(name).as_ptr() as isize);
+                }
+                SendMessageW(item(IDC_WEIGHT), 0x014E, TEXT_WEIGHT.load(Ordering::Relaxed) as usize, 0);
+                let mode = match (FOLLOW_WINDOWS.load(Ordering::Relaxed), DARK.load(Ordering::Relaxed)) {
+                    (true, _) => IDC_MATCH,
+                    (false, false) => IDC_LIGHT,
+                    (false, true) => IDC_DARK,
+                };
+                SendMessageW(item(mode), 0x00F1, 1, 0); // BM_SETCHECK
+                EDIT_FG.store(DARK_TEXT_COLOR.load(Ordering::Relaxed), Ordering::Relaxed);
+                EDIT_BG.store(DARK_BG_COLOR.load(Ordering::Relaxed), Ordering::Relaxed);
+                set_swatch(dlg, 0, EDIT_FG.load(Ordering::Relaxed));
+                set_swatch(dlg, 1, EDIT_BG.load(Ordering::Relaxed));
+                1
+            }
+            0x0138 => { // WM_CTLCOLORSTATIC: paint the swatches in their colors
+                for (i, id) in [IDC_FG_SWATCH, IDC_BG_SWATCH].into_iter().enumerate() {
+                    if l == GetDlgItem(dlg, id as i32) {
+                        return SWATCHES[i].load(Ordering::Relaxed);
+                    }
+                }
+                0
+            }
+            0x0111 => { // WM_COMMAND
+                match (w & 0xFFFF) as u16 {
+                    IDC_FG | IDC_BG => {
+                        let (i, cur) = if (w & 0xFFFF) as u16 == IDC_FG { (0, &EDIT_FG) } else { (1, &EDIT_BG) };
+                        if let Some(c) = choose_color(dlg, cur.load(Ordering::Relaxed)) {
+                            cur.store(c, Ordering::Relaxed);
+                            set_swatch(dlg, i, c);
+                        }
+                    }
+                    IDC_RESET => {
+                        EDIT_FG.store(DARK_TEXT, Ordering::Relaxed);
+                        EDIT_BG.store(DARK_BG, Ordering::Relaxed);
+                        set_swatch(dlg, 0, DARK_TEXT);
+                        set_swatch(dlg, 1, DARK_BG);
+                    }
+                    1 => { // OK: apply everything
+                        let pick = |id: u16| SendMessageW(GetDlgItem(dlg, id as i32), 0x0147, 0, 0); // CB_GETCURSEL
+                        if let Some(&s) = usize::try_from(pick(IDC_SIZE)).ok().and_then(|i| SIZES.get(i)) {
+                            TEXT_SIZE.store(s, Ordering::Relaxed);
+                        }
+                        if let Ok(i) = usize::try_from(pick(IDC_WEIGHT)) {
+                            TEXT_WEIGHT.store(i.min(WEIGHTS.len() - 1) as u32, Ordering::Relaxed);
+                        }
+                        let checked = |id: u16| SendMessageW(GetDlgItem(dlg, id as i32), 0x00F0, 0, 0) == 1; // BM_GETCHECK
+                        FOLLOW_WINDOWS.store(checked(IDC_MATCH), Ordering::Relaxed);
+                        DARK.store(if checked(IDC_MATCH) { windows_dark() } else { checked(IDC_DARK) }, Ordering::Relaxed);
+                        DARK_TEXT_COLOR.store(EDIT_FG.load(Ordering::Relaxed), Ordering::Relaxed);
+                        DARK_BG_COLOR.store(EDIT_BG.load(Ordering::Relaxed), Ordering::Relaxed);
+                        EndDialog(dlg, 1);
+                    }
+                    2 => {
+                        EndDialog(dlg, 0); // Cancel
+                    }
+                    _ => {}
+                }
+                1
+            }
+            _ => 0,
         }
     }
 
@@ -1179,23 +1431,12 @@ mod win {
                     ID_ZOOM_IN => step_zoom(1),
                     ID_ZOOM_OUT => step_zoom(-1),
                     ID_ZOOM_RESET => set_zoom(100),
-                    ID_DARK_FOLLOW => {
-                        FOLLOW_WINDOWS.store(true, Ordering::Relaxed);
-                        DARK.store(windows_dark(), Ordering::Relaxed);
-                        apply_theme();
-                    }
                     ID_DARK => {
                         FOLLOW_WINDOWS.store(false, Ordering::Relaxed);
                         DARK.fetch_xor(true, Ordering::Relaxed);
                         apply_theme();
                     }
-                    ID_DARK_TEXT => pick_color(&DARK_TEXT_COLOR),
-                    ID_DARK_BG => pick_color(&DARK_BG_COLOR),
-                    ID_DARK_RESET => {
-                        DARK_TEXT_COLOR.store(DARK_TEXT, Ordering::Relaxed);
-                        DARK_BG_COLOR.store(DARK_BG, Ordering::Relaxed);
-                        apply_theme();
-                    }
+                    ID_PREFS => prefs_dialog(),
                     _ => {}
                 }
                 0
@@ -1286,6 +1527,10 @@ mod win {
                     DARK_TEXT_COLOR.store(fg, Ordering::Relaxed);
                     DARK_BG_COLOR.store(bg, Ordering::Relaxed);
                 }
+                if let Some((size, weight)) = s.text {
+                    TEXT_SIZE.store(size, Ordering::Relaxed);
+                    TEXT_WEIGHT.store(weight, Ordering::Relaxed);
+                }
             }
             apply_theme(); // before the window shows, so dark mode doesn't flash white
             let mut argc = 0;
@@ -1348,6 +1593,23 @@ mod win {
                     DispatchMessageW(&msg);
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn text_prefs_scale_sizes_and_change_only_real_control_words() {
+            TEXT_SIZE.store(22, Ordering::Relaxed); // twice the default 11 pt
+            TEXT_WEIGHT.store(3, Ordering::Relaxed); // Semibold
+            // a heading, then document text that looks like RTF (escaped by the library)
+            let rtf = r"{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI;}}\fs22 {\b\fs40 Title}\par \\fs22 \{\\fs40\} \fi-360 x}";
+            assert_eq!(with_text_prefs(rtf), r"{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI Semibold;}}\fs44 {\b\fs80 Title}\par \\fs22 \{\\fs40\} \fi-360 x}");
+            TEXT_SIZE.store(DEFAULT_SIZE, Ordering::Relaxed);
+            TEXT_WEIGHT.store(DEFAULT_WEIGHT, Ordering::Relaxed);
+            assert_eq!(with_text_prefs(rtf), rtf);
         }
     }
 }
