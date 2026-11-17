@@ -1,5 +1,7 @@
-//! Legacy Word 97-2003 (.doc): compound file -> piece table -> RTF (text only).
+//! Legacy Word 97-2003 (.doc): compound file -> piece table -> RTF, with
+//! formatting from the property FKPs, the style sheet and the lists.
 
+use crate::numbers::{bullet, indent, number, symbol};
 use crate::rtf::Rtf;
 
 const ENDCHAIN: u32 = 0xFFFF_FFFE;
@@ -118,29 +120,60 @@ impl<'a> Cfb<'a> {
     }
 }
 
-// Character formatting, as bit flags.
-const BOLD: u8 = 1;
-const ITAL: u8 = 2;
-const UL: u8 = 4;
-const STRIKE: u8 = 8;
+// Character formatting, as bit flags. The same bits shifted left by OFF mark
+// formatting explicitly turned off, overriding a paragraph style that has it.
+const BOLD: u16 = 1;
+const ITAL: u16 = 2;
+const UL: u16 = 4;
+const STRIKE: u16 = 8;
+const SHOWN: u16 = BOLD | ITAL | UL | STRIKE;
 /// Deleted with change tracking on: not part of the document as shown.
-const DELETED: u8 = 16;
+const DELETED: u16 = 16;
 /// Hidden text: Word doesn't show or print it.
-const HIDDEN: u8 = 32;
-const SHOWN: u8 = BOLD | ITAL | UL | STRIKE;
+const HIDDEN: u16 = 32;
+const OFF: u16 = 8;
+
+/// RTF for formatting `f`: control words to turn on its bits (and off its OFF bits).
+fn fmt_words(f: u16, out: &mut Rtf) {
+    for (bit, on, off) in [(BOLD, "\\b ", "\\b0 "), (ITAL, "\\i ", "\\i0 "), (UL, "\\ul ", "\\ul0 "), (STRIKE, "\\strike ", "\\strike0 ")] {
+        if f & bit != 0 {
+            out.put(on);
+        } else if f & (bit << OFF) != 0 {
+            out.put(off);
+        }
+    }
+}
 
 /// The paragraph properties the viewer uses.
 #[derive(Clone, Copy, Default)]
 struct Pap {
     /// Index of its style in the style sheet.
     istd: u16,
-    /// A list item (numbered or bulleted).
-    list: bool,
+    /// List (by its override index) and level, if set directly on the paragraph.
+    ilfo: Option<u16>,
+    ilvl: Option<u8>,
     /// In a table: a paragraph in a cell, a cell end or a row end.
     in_table: bool,
     /// The mark that ends a table row.
     row_end: bool,
+    /// For a row end: its column edges, as an index into `Props::edges` (0 for none).
+    edges: u32,
 }
+
+/// A style from the style sheet; after `resolve`, with what it inherits.
+#[derive(Clone, Copy)]
+struct Style {
+    /// Built-in style identifier (0xFFF for none or a user-defined style).
+    sti: u16,
+    /// The style it's based on (0xFFF for none).
+    base: u16,
+    /// Character formatting.
+    fmt: u16,
+    ilfo: Option<u16>,
+    ilvl: Option<u8>,
+}
+
+const NO_STYLE: Style = Style { sti: 0xFFF, base: 0xFFF, fmt: 0, ilfo: None, ilvl: None };
 
 /// Formatting runs from FKPs: (first fc, end fc, value), sorted by first fc.
 /// Text positions outside every run have default formatting.
@@ -204,18 +237,23 @@ fn sprms(mut g: &[u8], mut f: impl FnMut(u16, &[u8])) {
     }
 }
 
-/// Set or clear `bit` by a toggle operand: 1 on, 0 off; 0x81 means the
-/// opposite of the style, which is taken as on (styles rarely set these).
-fn toggle(flags: &mut u8, bit: u8, op: &[u8]) {
+/// Apply a toggle operand to `bit`: 1 on, 0 off, 0x80 as the style says, and
+/// 0x81 the opposite of the style, taken as on (styles rarely set these).
+fn toggle(f: &mut u16, bit: u16, op: &[u8]) {
+    *f &= !(bit | bit << OFF);
     match op.first() {
-        Some(1 | 0x81) => *flags |= bit,
-        _ => *flags &= !bit,
+        Some(1 | 0x81) => *f |= bit,
+        Some(0) => *f |= bit << OFF,
+        _ => {}
     }
 }
 
-fn chp(grpprl: &[u8]) -> u8 {
+/// Character formatting from a CHPX grpprl; `styles` resolve character styles.
+fn chp(grpprl: &[u8], styles: &[Style]) -> u16 {
     let mut f = 0;
     sprms(grpprl, |id, op| match id {
+        // sprmCIstd: a character style, which the other sprms then modify
+        0x4A30 => f |= u16at(op, 0).and_then(|i| styles.get(i)).map_or(0, |s| s.fmt),
         0x0835 => toggle(&mut f, BOLD, op),    // sprmCFBold
         0x0836 => toggle(&mut f, ITAL, op),    // sprmCFItalic
         0x0837 => toggle(&mut f, STRIKE, op),  // sprmCFStrike
@@ -227,13 +265,26 @@ fn chp(grpprl: &[u8]) -> u8 {
     f
 }
 
-fn pap(istd: u16, grpprl: &[u8]) -> Pap {
+/// Paragraph properties from a PAPX grpprl. A row end's column edges are
+/// added to `edges`.
+fn pap(istd: u16, grpprl: &[u8], edges: &mut Vec<Vec<i32>>) -> Pap {
     let mut p = Pap { istd, ..Pap::default() };
     sprms(grpprl, |id, op| match id {
-        0x460B => p.list = u16at(op, 0).is_some_and(|v| (v as i16) > 0), // sprmPIlfo
+        0x460B => p.ilfo = u16at(op, 0).map(|v| v as u16),                 // sprmPIlfo
+        0x260A => p.ilvl = op.first().copied(),                            // sprmPIlvl
         0x2416 => p.in_table = op.first().is_some_and(|&v| v != 0),        // sprmPFInTable
         0x2417 => p.row_end = op.first().is_some_and(|&v| v != 0),         // sprmPFTtp
         0x6649 => p.in_table |= u32at(op, 0).is_some_and(|v| v as i32 > 0), // sprmPItap
+        // sprmTDefTable: cb (2), itcMac (1), then itcMac + 1 cell boundaries
+        0xD608 => {
+            let n = op.get(2).map_or(0, |&n| n as usize);
+            let at = |i: usize| u16at(op, 3 + i * 2).map(|v| v as i16 as i32);
+            let b: Option<Vec<i32>> = (0..=n).map(at).collect();
+            if let Some(b) = b.filter(|b| (2..=64).contains(&b.len())) {
+                edges.push(b[1..].iter().map(|x| x - b[0]).collect());
+                p.edges = edges.len() as u32 - 1;
+            }
+        }
         _ => {}
     });
     p
@@ -253,7 +304,7 @@ fn fkp_pages<'a>(wd: &'a [u8], plc: &[u8]) -> Vec<&'a [u8]> {
 }
 
 /// Character formatting runs (non-default only), from the CHPX FKPs.
-fn chpx_runs(wd: &[u8], plc: &[u8]) -> Vec<(u32, u32, u8)> {
+fn chpx_runs(wd: &[u8], plc: &[u8], styles: &[Style]) -> Vec<(u32, u32, u16)> {
     let mut runs = Vec::new();
     for page in fkp_pages(wd, plc) {
         let crun = page[511] as usize;
@@ -264,7 +315,7 @@ fn chpx_runs(wd: &[u8], plc: &[u8]) -> Vec<(u32, u32, u8)> {
             let (Some(a), Some(b), Some(&rgb)) = (u32at(page, i * 4), u32at(page, i * 4 + 4), page.get((crun + 1) * 4 + i)) else { continue };
             let o = rgb as usize * 2;
             let f = match page.get(o) {
-                Some(&cb) if o > 0 => page.get(o + 1..o + 1 + cb as usize).map_or(0, chp),
+                Some(&cb) if o > 0 => page.get(o + 1..o + 1 + cb as usize).map_or(0, |g| chp(g, styles)),
                 _ => 0,
             };
             if f != 0 && a < b {
@@ -276,7 +327,7 @@ fn chpx_runs(wd: &[u8], plc: &[u8]) -> Vec<(u32, u32, u8)> {
 }
 
 /// Paragraph property runs, from the PAPX FKPs.
-fn papx_runs(wd: &[u8], plc: &[u8]) -> Vec<(u32, u32, Pap)> {
+fn papx_runs(wd: &[u8], plc: &[u8], edges: &mut Vec<Vec<i32>>) -> Vec<(u32, u32, Pap)> {
     let mut runs = Vec::new();
     for page in fkp_pages(wd, plc) {
         let crun = page[511] as usize;
@@ -294,7 +345,7 @@ fn papx_runs(wd: &[u8], plc: &[u8]) -> Vec<(u32, u32, Pap)> {
             };
             if let Some(g) = grp.filter(|_| a < b) {
                 if let Some(istd) = u16at(g, 0) {
-                    runs.push((a, b, pap(istd as u16, &g[2..])));
+                    runs.push((a, b, pap(istd as u16, &g[2..], edges)));
                 }
             }
         }
@@ -302,18 +353,72 @@ fn papx_runs(wd: &[u8], plc: &[u8]) -> Vec<(u32, u32, Pap)> {
     runs
 }
 
-/// Each style's built-in identifier (sti), indexed by style number (istd).
-fn style_ids(stsh: &[u8]) -> Vec<u16> {
-    let (Some(cb), Some(cstd)) = (u16at(stsh, 0), u16at(stsh, 2)) else { return Vec::new() };
+/// The style sheet (STSH), indexed by style number (istd), without inheritance.
+fn styles(stsh: &[u8]) -> Vec<Style> {
+    let (Some(cb), Some(cstd), Some(cbase)) = (u16at(stsh, 0), u16at(stsh, 2), u16at(stsh, 4)) else { return Vec::new() };
     let mut at = 2 + cb;
     let mut out = Vec::new();
     for _ in 0..cstd {
         let Some(n) = u16at(stsh, at) else { break };
-        // an empty slot (n == 0) is no style
-        out.push(if n >= 2 { u16at(stsh, at + 2).map_or(0xFFF, |v| v as u16 & 0xFFF) } else { 0xFFF });
+        out.push(stsh.get(at + 2..at + 2 + n).map_or(NO_STYLE, |s| style(s, cbase)));
         at += 2 + n;
     }
     out
+}
+
+/// One STD: its base (StdfBase and maybe StdfPost2000, `cbase` bytes), name,
+/// then its UPXs: for a paragraph style, paragraph then character properties;
+/// for a character style, character properties.
+fn style(s: &[u8], cbase: usize) -> Style {
+    let mut st = NO_STYLE;
+    let (Some(a), Some(b)) = (u16at(s, 0), u16at(s, 2)) else { return st };
+    (st.sti, st.base) = (a as u16 & 0xFFF, b as u16 >> 4);
+    let Some(cch) = u16at(s, cbase) else { return st };
+    let mut at = cbase + 2 + cch * 2 + 2; // the name, then a terminating 0
+    let mut upx = || upx(s, &mut at);
+    match b & 0xF {
+        1 => {
+            if let Some(g) = upx().and_then(|u| u.get(2..)) {
+                let p = pap(0, g, &mut Vec::new());
+                (st.ilfo, st.ilvl) = (p.ilfo, p.ilvl);
+            }
+            st.fmt = upx().map_or(0, |g| chp(g, &[]));
+        }
+        2 => st.fmt = upx().map_or(0, |g| chp(g, &[])),
+        _ => {}
+    }
+    st
+}
+
+/// The UPX at `*at` (its size, contents, then padding to an even size); moves past it.
+fn upx<'a>(s: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
+    let n = u16at(s, *at)?;
+    let u = s.get(*at + 2..*at + 2 + n)?;
+    *at += 2 + n + (n & 1);
+    Some(u)
+}
+
+/// Each style with what it inherits from the styles it's based on.
+fn resolve(raw: &[Style]) -> Vec<Style> {
+    (0..raw.len())
+        .map(|i| {
+            let mut chain = Vec::new();
+            let mut j = i;
+            while let Some(&s) = raw.get(j).filter(|_| chain.len() < 16) {
+                chain.push(s);
+                j = s.base as usize;
+            }
+            let mut res = raw[i];
+            res.fmt = 0;
+            for s in chain.iter().rev() {
+                // a style's own formatting wins; explicit "off" clears what it inherits
+                res.fmt = (res.fmt & !(s.fmt >> OFF) | s.fmt) & (SHOWN | DELETED | HIDDEN);
+                res.ilfo = s.ilfo.or(res.ilfo);
+                res.ilvl = s.ilvl.or(res.ilvl);
+            }
+            res
+        })
+        .collect()
 }
 
 /// Heading level by built-in style: 1 to 3 (4 to 9 show as 3), or 4 for Title.
@@ -327,8 +432,77 @@ fn heading(sti: u16) -> usize {
     }
 }
 
+/// One list level: its first number, number format (nfc), and label template,
+/// in which characters 0 to 8 stand for the numbers of levels 1 to 9.
+struct Lvl {
+    start: i32,
+    nfc: u8,
+    text: Vec<u16>,
+}
+
+/// The document's lists, and its list overrides (by ilfo - 1), which say
+/// which list a paragraph's ilfo means.
+#[derive(Default)]
+struct Lists {
+    lists: std::collections::HashMap<u32, Vec<Lvl>>,
+    lfos: Vec<u32>,
+    /// Current numbers, per ilfo and level.
+    counts: std::collections::HashMap<u16, [Option<i32>; 9]>,
+}
+
+impl Lists {
+    /// From PlfLst and PlfLfo. `lst` is the table stream from the PlfLst on:
+    /// its LSTF records are followed, outside its recorded size, by each list's LVLs.
+    fn read(lst: &[u8], lfo: &[u8]) -> Lists {
+        let mut l = Lists::default();
+        let n = u16at(lst, 0).map_or(0, |n| (n as i16).max(0) as usize).min(lst.len() / 28);
+        let mut at = 2 + n * 28;
+        'lists: for i in 0..n {
+            let f = 2 + i * 28;
+            let (Some(lsid), Some(&flags)) = (u32at(lst, f), lst.get(f + 26)) else { break };
+            let mut lvls = Vec::new();
+            for _ in 0..if flags & 1 != 0 { 1 } else { 9 } {
+                // LVLF (28 bytes), grpprlPapx, grpprlChpx, then the label (xst)
+                let Some(lvlf) = lst.get(at..at + 28) else { break 'lists };
+                at += 28 + lvlf[25] as usize + lvlf[24] as usize;
+                let Some(cch) = u16at(lst, at) else { break 'lists };
+                let Some(text) = (0..cch).map(|k| u16at(lst, at + 2 + k * 2).map(|c| c as u16)).collect() else { break 'lists };
+                at += 2 + cch * 2;
+                lvls.push(Lvl { start: i32::from_le_bytes([lvlf[0], lvlf[1], lvlf[2], lvlf[3]]), nfc: lvlf[4], text });
+            }
+            l.lists.insert(lsid, lvls);
+        }
+        let n = u32at(lfo, 0).map_or(0, |n| n as usize).min(lfo.len() / 16);
+        l.lfos = (0..n).map_while(|i| u32at(lfo, 4 + i * 16)).collect();
+        l
+    }
+
+    /// Count a list paragraph and return its label (empty for none) and
+    /// whether it is a bullet, or None if its list can't be found.
+    fn label(&mut self, ilfo: u16, ilvl: u8) -> Option<(Vec<u32>, bool)> {
+        let lvls = self.lists.get(self.lfos.get((ilfo as usize).checked_sub(1)?)?)?;
+        let d = (ilvl as usize).min(lvls.len().checked_sub(1)?);
+        let lvl = &lvls[d];
+        let c = self.counts.entry(ilfo).or_insert([None; 9]);
+        c[d] = Some(c[d].map_or(lvl.start, |n| n.saturating_add(1)));
+        c[d + 1..].fill(None); // deeper levels restart
+        if lvl.nfc == 255 {
+            return Some((Vec::new(), false)); // no number
+        }
+        let mut out = Vec::new();
+        for &ch in &lvl.text {
+            match lvls.get(ch as usize).filter(|_| ch < 9) {
+                Some(l) => out.extend(number(c[ch as usize].unwrap_or(l.start), l.nfc).chars().map(|c| c as u32)),
+                None => out.push(if lvl.nfc == 23 { bullet(ch) } else { symbol(ch) }),
+            }
+        }
+        Some((out, lvl.nfc == 23))
+    }
+}
+
 /// Above this, a paragraph or table row is written out before its end is seen
-/// (losing its style), so pathological paragraphs can't hold unbounded memory.
+/// (losing its style, or its table layout), so pathological paragraphs can't
+/// hold unbounded memory.
 const FLUSH: usize = 1 << 20;
 
 pub fn render(z: &[u8]) -> Option<String> {
@@ -358,19 +532,27 @@ pub fn render(z: &[u8]) -> Option<String> {
     let ccp = (u32at(&wd, lw + 2 + 12)? as usize).min(wd.len());
     let pairs = lw + 2 + u16at(&wd, lw)? * 4;
     let npairs = u16at(&wd, pairs)?;
-    let pair = |i: usize| -> Option<&[u8]> {
+    // Pair `i`: where a structure starts in the table stream, and its size.
+    let pos = |i: usize| -> Option<(usize, usize)> {
         if i >= npairs {
             return None;
         }
-        let fc = u32at(&wd, pairs + 2 + i * 8)? as usize;
-        tbl.get(fc..fc.checked_add(u32at(&wd, pairs + 2 + i * 8 + 4)? as usize)?)
+        Some((u32at(&wd, pairs + 2 + i * 8)? as usize, u32at(&wd, pairs + 2 + i * 8 + 4)? as usize))
+    };
+    let pair = |i: usize| -> Option<&[u8]> {
+        let (fc, lcb) = pos(i)?;
+        tbl.get(fc..fc.checked_add(lcb)?)
     };
     let clx = pair(33)?; // fcClx
     // Formatting is optional: if it can't be read, the text still shows.
-    let stis = pair(1).map(style_ids).unwrap_or_default(); // fcStshf
-    let mut chps = Runs::new(pair(12).map(|p| chpx_runs(&wd, p)).unwrap_or_default()); // fcPlcfBteChpx
-    let mut paps = Runs::new(pair(13).map(|p| papx_runs(&wd, p)).unwrap_or_default()); // fcPlcfBtePapx
+    let styles = resolve(&pair(1).map(styles).unwrap_or_default()); // fcStshf
+    let style = |istd: u16| styles.get(istd as usize).copied().unwrap_or(NO_STYLE);
+    let mut chps = Runs::new(pair(12).map(|p| chpx_runs(&wd, p, &styles)).unwrap_or_default()); // fcPlcfBteChpx
+    let mut edges = vec![Vec::new()]; // index 0: no column edges
+    let mut paps = Runs::new(pair(13).map(|p| papx_runs(&wd, p, &mut edges)).unwrap_or_default()); // fcPlcfBtePapx
     let has_paps = !paps.runs.is_empty();
+    let lst = pos(73).filter(|&(_, lcb)| lcb > 0).and_then(|(fc, _)| tbl.get(fc..)); // fcPlfLst, and the LVLs after it
+    let mut lists = Lists::read(lst.unwrap_or_default(), pair(74).unwrap_or_default()); // fcPlfLfo
 
     let mut at = 0;
     while clx.get(at) == Some(&1) {
@@ -387,12 +569,26 @@ pub fn render(z: &[u8]) -> Option<String> {
     let mut fields: Vec<bool> = Vec::new(); // per open field: showing its result yet?
     let mut hidden = 0; // open fields still in their code part
     // A paragraph's style is stored with its mark, at its end, so each paragraph
-    // (or table cell) collects in `para` until then; a table row in `row`.
-    let (mut para, mut row) = (Rtf::fragment(), Rtf::fragment());
+    // (or table cell) collects in `para` until then; a table row in `cells`.
+    let mut para = Rtf::fragment();
     let mut fmt = 0; // formatting of the open run group in `para`, 0 for none
     let mut para_started = false; // part of `para` already written out (see FLUSH)
-    let (mut in_row, mut row_started, mut cell_done, mut prev_cell) = (false, false, false, false);
+    let (mut cell, mut cells) = (Rtf::fragment(), Vec::<String>::new());
+    let mut row_bytes = 0; // size of `cells`, counting each cell as at least 16 bytes
+    let mut prev_cell = false; // the last mark was a cell end
+    let mut after_table = false; // space the next paragraph from the table above
     let mut prev = 0;
+    // Write a row out as a table row; or, if it got too big, as a paragraph.
+    let flush_row = |r: &mut Rtf, cells: &mut Vec<String>, row_bytes: &mut usize, edges: &[i32]| {
+        if std::mem::take(row_bytes) <= FLUSH {
+            r.row(cells, edges);
+        } else {
+            r.put("\\pard\\sa60 ");
+            r.put(&cells.join("\\tab\\u9474?  "));
+            r.put("\\par\n");
+        }
+        cells.clear();
+    };
     for i in 0..npc {
         let (a, b) = (u32at(cps, i * 4)? as usize, (u32at(cps, i * 4 + 4)? as usize).min(ccp));
         if a >= ccp || a < prev || b < a {
@@ -443,21 +639,18 @@ pub fn render(z: &[u8]) -> Option<String> {
                     if f & (DELETED | HIDDEN) != 0 {
                         continue;
                     }
+                    let shown = f & (SHOWN | SHOWN << OFF);
                     if !matches!(ch, 0x0D | 0x0C | 0x07) {
                         prev_cell = false;
-                        if f & SHOWN != fmt {
+                        if shown != fmt {
                             if fmt != 0 {
                                 para.put("}");
                             }
-                            if f & SHOWN != 0 {
+                            if shown != 0 {
                                 para.put("{");
-                                for (bit, word) in [(BOLD, "\\b "), (ITAL, "\\i "), (UL, "\\ul "), (STRIKE, "\\strike ")] {
-                                    if f & bit != 0 {
-                                        para.put(word);
-                                    }
-                                }
+                                fmt_words(shown, &mut para);
                             }
-                            fmt = f & SHOWN;
+                            fmt = shown;
                         }
                         match ch {
                             0x0B => para.put("\\line "),
@@ -481,70 +674,87 @@ pub fn render(z: &[u8]) -> Option<String> {
                         fmt = 0;
                     }
                     let p = paps.at(fc);
-                    let into_row = |row: &mut Rtf, para: &mut Rtf, cell_done: &mut bool| {
-                        if std::mem::take(cell_done) {
-                            row.put("\\tab\\u9474?  ");
-                        }
-                        row.put(&para.take());
-                    };
                     if ch == 0x07 {
                         // Without paragraph properties, a second cell mark in a
                         // row is taken as the row end (wrong after an empty cell).
                         let row_end = if has_paps && (p.in_table || p.row_end) { p.row_end } else { prev_cell };
                         if row_end {
-                            if !row_started {
-                                r.put("\\pard\\sa60 ");
-                            }
-                            r.put(&row.take());
-                            r.put("\\par\n");
+                            flush_row(&mut r, &mut cells, &mut row_bytes, edges.get(p.edges as usize).map_or(&[][..], |e| &e[..]));
+                            after_table = true;
                             para.take();
-                            (in_row, row_started, cell_done, prev_cell) = (false, false, false, false);
+                            cell.take();
+                            prev_cell = false;
                         } else {
-                            into_row(&mut row, &mut para, &mut cell_done);
-                            (in_row, cell_done, prev_cell) = (true, true, true);
+                            let mut c = cell.take();
+                            c.push_str(&para.take());
+                            row_bytes += c.len().max(16);
+                            cells.push(c);
+                            prev_cell = true;
                         }
                     } else if has_paps && p.in_table {
                         // one of several paragraphs in a cell
-                        into_row(&mut row, &mut para, &mut cell_done);
-                        row.put("\\line ");
-                        in_row = true;
+                        cell.put(&para.take());
+                        cell.put("\\line ");
                     } else {
-                        if in_row {
+                        if !cells.is_empty() || cell.size() > 0 {
                             // a table that ended without a row mark
-                            if !row_started {
-                                r.put("\\pard\\sa60 ");
-                            }
-                            r.put(&row.take());
-                            r.put("\\par\n");
-                            (in_row, row_started, cell_done) = (false, false, false);
+                            let c = cell.take();
+                            row_bytes += c.len().max(16);
+                            cells.push(c);
+                            flush_row(&mut r, &mut cells, &mut row_bytes, &[]);
+                            after_table = true;
                         }
-                        let sti = stis.get(p.istd as usize).copied().unwrap_or(0xFFF);
-                        let head = if para_started { 0 } else { heading(sti) };
+                        let st = style(p.istd);
+                        let head = if para_started { 0 } else { heading(st.sti) };
+                        let (ilfo, ilvl) = (p.ilfo.or(st.ilfo).unwrap_or(0), p.ilvl.or(st.ilvl).unwrap_or(0).min(8));
+                        let listed = (ilfo as i16) > 0 && !para_started;
+                        let label = if listed { lists.label(ilfo, ilvl) } else { None };
                         if !para_started {
                             r.put("\\pard\\sa160 ");
-                            // a list item, or a List Bullet / List Number style;
-                            // headings are often in a list too, for outline numbering
-                            if head == 0 && (p.list || matches!(sti, 48 | 49 | 54..=61)) {
-                                r.put("\\li360\\fi-240 \\bullet\\tab ");
+                            if std::mem::take(&mut after_table) {
+                                r.put("\\sb120 ");
+                            }
+                            if head == 0 && listed {
+                                match &label {
+                                    Some((label, _)) => {
+                                        r.put(&indent(ilvl, label.len()));
+                                        label.iter().for_each(|&c| r.ch(c));
+                                        r.put("\\tab ");
+                                    }
+                                    None => r.put(&format!("{}\\bullet\\tab ", indent(ilvl, 1))),
+                                }
+                            } else if head == 0 && matches!(st.sti, 48 | 49 | 54..=61) {
+                                // a List Bullet / List Number style without a list
+                                r.put(&format!("{}\\bullet\\tab ", indent(0, 1)));
                             }
                         }
-                        if head > 0 {
+                        // the paragraph style's character formatting, which runs
+                        // in it may turn off
+                        let wrap = head > 0 || st.fmt & SHOWN != 0;
+                        if wrap {
                             r.put("{");
                             r.put(HEAD[head]);
+                            fmt_words(st.fmt & SHOWN & if head > 0 { !BOLD } else { SHOWN }, &mut r);
+                        }
+                        // a heading in a numbered outline shows its number (a bulleted one, nothing)
+                        if let Some((label, false)) = label.filter(|_| head > 0) {
+                            if !label.is_empty() {
+                                label.into_iter().for_each(|c| r.ch(c));
+                                r.put(" ");
+                            }
                         }
                         r.put(&para.take());
-                        if head > 0 {
+                        if wrap {
                             r.put("}");
                         }
                         r.put("\\par\n");
                         para_started = false;
                     }
-                    if row.size() > FLUSH {
-                        if !row_started {
-                            r.put("\\pard\\sa60 ");
-                        }
-                        r.put(&row.take());
-                        row_started = true;
+                    if cell.size() + row_bytes > FLUSH {
+                        let c = cell.take();
+                        row_bytes += c.len().max(16);
+                        cells.push(c);
+                        flush_row(&mut r, &mut cells, &mut row_bytes, &[]);
                     }
                 }
             }
@@ -554,7 +764,10 @@ pub fn render(z: &[u8]) -> Option<String> {
     if fmt != 0 {
         para.put("}");
     }
-    r.put(&row.take());
+    if !cells.is_empty() {
+        flush_row(&mut r, &mut cells, &mut row_bytes, &[]);
+    }
+    r.put(&cell.take());
     r.put(&para.take());
     Some(r.finish())
 }

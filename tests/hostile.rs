@@ -128,8 +128,9 @@ fn docx_hidden_text_is_not_shown() {
 // ---- legacy Word (.doc) ----
 
 /// Saved by OpenOffice as Word 97: a title, headings, bold/italic/underline, a
-/// bulleted list, a hyperlink field, a table with an empty cell, hidden text,
-/// and a deletion and an insertion made with change tracking on.
+/// bulleted list, a two-level numbered list, a hyperlink field, a table with
+/// an empty cell, hidden text, and a deletion and an insertion made with
+/// change tracking on.
 const DOC: &[u8] = include_bytes!("fixtures/sample.doc");
 
 #[test]
@@ -138,17 +139,31 @@ fn doc_renders_with_formatting() {
     for want in [
         r"{\b\fs52 Garden Notes}",
         r"{\b\fs40 First Section}",
-        r"{\b\fs32 Shopping List}",
+        r"{\b\fs32 \i Shopping List}", // Heading 2 is italic in OpenOffice
         r"{\b bold}",
         r"{\i italic}",
         r"{\ul underlined}",
-        r"\bullet\tab Seeds",
         "See the website for more.", // the field's result, not its code
     ] {
         assert!(rtf.contains(want), "missing {want} in {rtf}");
     }
-    // headings are in an outline-numbering list, but aren't bullets
-    assert!(!rtf.contains(r"\bullet\tab {\b"));
+}
+
+#[test]
+fn doc_lists_are_numbered_and_bulleted() {
+    let paras = word_viewer::read(DOC, "sample.doc").unwrap();
+    // headings are in an outline-numbering list too, but show no number
+    for item in ["\u{2022} Seeds", "\u{2022} Compost", "1. Dig", "2. Plant", "1. Water daily", "2. Weed weekly", "3. Harvest", "Steps"] {
+        assert!(paras.iter().any(|p| p == item), "missing {item:?} in {paras:?}");
+    }
+}
+
+#[test]
+fn doc_tables_are_tables() {
+    let rtf = word_viewer::to_rtf(DOC).unwrap();
+    // three columns with the widths stored in the file
+    assert_eq!(rtf.matches(r"\row").count(), 3);
+    assert!(rtf.contains(r"\cellx3324") && rtf.contains(r"\cellx9972"), "{rtf}");
 }
 
 #[test]
@@ -176,6 +191,55 @@ fn doc_survives_truncation_and_corruption() {
         d[i] ^= 0xFF;
         let _ = word_viewer::to_rtf(&d);
     }
+}
+
+// ---- .docx features ----
+
+/// Built by hand: German style ids (Word localizes them), a two-level
+/// numbered list, a style that carries numbering (starting at IV), hidden
+/// text, a tracked formatting change, moved text, and a table with column
+/// widths, a merged cell, an empty cell and a two-paragraph cell.
+const FEATURES: &[u8] = include_bytes!("fixtures/features.docx");
+
+#[test]
+fn docx_headings_lists_and_tables() {
+    let rtf = word_viewer::to_rtf(FEATURES).unwrap();
+    for want in [r"{\b\fs52 Gartenbericht}", r"{\b\fs40 Erster Abschnitt}", r"{\b\fs32 Kapitel Zwei}", r"\cellx2000", r"\cellx5000", r"\cellx9000"] {
+        assert!(rtf.contains(want), "missing {want} in {rtf}");
+    }
+    let paras = word_viewer::read(FEATURES, "features.docx").unwrap();
+    for p in ["1. Dig", "2. Plant", "2.a) Water daily", "2.b) Weed weekly", "3. Harvest", "IV. Styled item one", "V. Styled item two", "Visible text.", "NOW-PLAIN", "Stays.", "Plant Count Notes", "Tomato 12", "Spans two Line one Line two", "After the table."] {
+        assert!(paras.iter().any(|x| x == p), "missing {p:?} in {paras:?}");
+    }
+    for gone in ["HIDDEN-TEXT", "MOVED-AWAY"] {
+        assert!(!rtf.contains(gone), "{gone} shown");
+    }
+    assert!(!rtf.contains(r"{\b NOW-PLAIN"), "formatting from before a tracked change shown");
+}
+
+#[test]
+fn docx_features_survive_truncation_and_corruption() {
+    for n in 0..FEATURES.len() {
+        let _ = word_viewer::to_rtf(&FEATURES[..n]);
+    }
+    for i in 0..FEATURES.len() {
+        let mut d = FEATURES.to_vec();
+        d[i] ^= 0xFF;
+        let _ = word_viewer::to_rtf(&d);
+    }
+}
+
+#[test]
+fn table_and_list_floods_are_capped() {
+    // a million empty cells in one row
+    let mut xml = b"<w:tbl><w:tr>".to_vec();
+    xml.extend(b"<w:tc></w:tc>".repeat(1_000_000));
+    xml.extend(b"</w:tr></w:tbl>");
+    let rtf = quick(|| word_viewer::to_rtf(&zip("word/document.xml", &xml, xml.len() as u32, 0))).unwrap();
+    assert!(rtf.len() <= (32 << 20) + 1);
+    // 200,000 list items at an out-of-range level of an undefined list
+    let xml = br#"<w:p><w:pPr><w:numPr><w:ilvl w:val="99"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#.repeat(200_000);
+    quick(|| word_viewer::to_rtf(&zip("word/document.xml", &xml, xml.len() as u32, 0))).unwrap();
 }
 
 // ---- every other format (PDF, RTF, ODT, EPUB, HTML, text) ----

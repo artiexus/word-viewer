@@ -19,7 +19,7 @@ pub fn paragraphs(rtf: &str) -> Vec<String> {
     };
     while let Some(c) = it.next() {
         match c {
-            '{' if it.clone().take(8).collect::<String>() == "\\fonttbl" => {
+            '{' if ["\\fonttbl", "\\colortb"].contains(&it.clone().take(8).collect::<String>().as_str()) => {
                 let mut depth = 1;
                 for c in it.by_ref() {
                     match c {
@@ -50,8 +50,8 @@ pub fn paragraphs(rtf: &str) -> Vec<String> {
                 }
                 it.next_if_eq(&' '); // a control word's delimiting space
                 match word.as_str() {
-                    "par" => flush(&mut cur, &mut out),
-                    "line" | "tab" => cur.push(' '),
+                    "par" | "row" => flush(&mut cur, &mut out),
+                    "line" | "tab" | "cell" => cur.push(' '),
                     "u" => {
                         it.next_if_eq(&'?'); // fallback character
                         let u = num.parse::<i32>().unwrap_or(0xFFFD) as i16 as u16;
