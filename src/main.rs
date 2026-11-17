@@ -281,6 +281,7 @@ mod win {
         fn LoadLibraryExW(name: *const u16, file: isize, flags: u32) -> isize;
         fn GetModuleHandleW(name: *const u16) -> isize;
         fn GetProcAddress(module: isize, name: *const u8) -> *const c_void;
+        fn GetCurrentThreadId() -> u32;
         fn GetCommandLineW() -> *const u16;
         fn LocalFree(mem: *mut c_void) -> *mut c_void;
         fn GlobalFree(mem: isize) -> isize;
@@ -318,6 +319,13 @@ mod win {
         fn GetMenuItemCount(menu: isize) -> i32;
         fn GetMenuItemInfoW(menu: isize, item: u32, by_position: i32, mi: *mut MenuItemInfo) -> i32;
         fn SetMenu(h: Hwnd, menu: isize) -> i32;
+        fn GetClassNameW(h: Hwnd, name: *mut u16, n: i32) -> i32;
+        fn GetClientRect(h: Hwnd, r: *mut Rect) -> i32;
+        fn ClientToScreen(h: Hwnd, pt: *mut i32) -> i32;
+        fn SetWindowLongPtrW(h: Hwnd, index: i32, value: isize) -> isize;
+        fn CallWindowProcW(prev: isize, h: Hwnd, m: u32, w: usize, l: isize) -> isize;
+        fn SetWindowsHookExW(id: i32, hook: unsafe extern "system" fn(i32, usize, isize) -> isize, module: isize, thread: u32) -> isize;
+        fn CallNextHookEx(hook: isize, code: i32, w: usize, l: isize) -> isize;
         fn GetActiveWindow() -> Hwnd;
         fn DestroyMenu(menu: isize) -> i32;
         fn GetMenuBarInfo(h: Hwnd, object: i32, item: i32, mbi: *mut MenuBarInfo) -> i32;
@@ -406,6 +414,7 @@ mod win {
     const ID_DARK_TEXT: usize = 13;
     const ID_DARK_BG: usize = 14;
     const ID_DARK_RESET: usize = 15;
+    const ID_DARK_FOLLOW: usize = 16;
     /// Dark mode colors (COLORREF, 0x00BBGGRR): Windows Terminal's default
     /// "Campbell" scheme, background #0C0C0C and text #CCCCCC.
     const DARK_BG: u32 = 0x000C_0C0C;
@@ -421,6 +430,8 @@ mod win {
     /// The find dialog's state, which must outlive the (modeless) dialog.
     static FIND: AtomicPtr<Find> = AtomicPtr::new(null_mut());
     static DARK: AtomicBool = AtomicBool::new(false);
+    /// Dark mode follows Windows' app mode until the user picks one.
+    static FOLLOW_WINDOWS: AtomicBool = AtomicBool::new(true);
     static DARK_TEXT_COLOR: AtomicU32 = AtomicU32::new(DARK_TEXT);
     static DARK_BG_COLOR: AtomicU32 = AtomicU32::new(DARK_BG);
     static VIEW_MENU: AtomicIsize = AtomicIsize::new(0);
@@ -462,7 +473,8 @@ mod win {
         normal: Rect,
         maximized: bool,
         zoom: u32,
-        dark: bool,
+        /// Dark or light as the user chose, or None to follow Windows.
+        dark: Option<bool>,
         /// Dark mode's text and background colors.
         colors: Option<(u32, u32)>,
     }
@@ -473,8 +485,13 @@ mod win {
         let v: Vec<i64> = s.split_whitespace().map(|x| x.parse().ok()).collect::<Option<_>>()?;
         let &[l, t, r, b, max, zoom] = v.get(..6)? else { return None };
         let [l, t, r, b] = [l, t, r, b].map(|x| x.clamp(-100_000, 100_000) as i32);
-        // later fields were added over time: dark mode, then its colors
-        let dark = v.get(6).is_some_and(|&d| d != 0);
+        // later fields were added over time: dark mode (0 follow Windows,
+        // 1 dark, 2 light), then its colors
+        let dark = match v.get(6) {
+            Some(1) => Some(true),
+            Some(2) => Some(false),
+            _ => None,
+        };
         let colors = match v.get(7..9) {
             Some(&[fg, bg]) => Some(((fg & 0xFF_FFFF) as u32, (bg & 0xFF_FFFF) as u32)),
             _ => None,
@@ -490,7 +507,11 @@ mod win {
             return;
         }
         let n = wp.normal;
-        let dark = DARK.load(Ordering::Relaxed) as u8;
+        let dark = match (FOLLOW_WINDOWS.load(Ordering::Relaxed), DARK.load(Ordering::Relaxed)) {
+            (true, _) => 0,
+            (false, true) => 1,
+            (false, false) => 2,
+        };
         let (fg, bg) = (DARK_TEXT_COLOR.load(Ordering::Relaxed), DARK_BG_COLOR.load(Ordering::Relaxed));
         let line = format!("{} {} {} {} {} {} {dark} {fg} {bg}\n", n.left, n.top, n.right, n.bottom, (wp.show_cmd == 3) as u8, zoom());
         if let Some(path) = settings_path() {
@@ -647,7 +668,9 @@ mod win {
                 let info = MenuInfo { size: std::mem::size_of::<MenuInfo>() as u32, mask: 0x2 | 0x8000_0000, back: brush, ..std::mem::zeroed() }; // MIM_BACKGROUND | MIM_APPLYTOSUBMENUS
                 SetMenuInfo(bar, &info);
             }
+            let follow = FOLLOW_WINDOWS.load(Ordering::Relaxed);
             CheckMenuItem(VIEW_MENU.load(Ordering::Relaxed), ID_DARK as u32, if dark { 0x8 } else { 0 }); // MF_CHECKED
+            CheckMenuItem(VIEW_MENU.load(Ordering::Relaxed), ID_DARK_FOLLOW as u32, if follow { 0x8 } else { 0 });
             SetMenu(win, bar);
             if old_menu != 0 {
                 DestroyMenu(old_menu);
@@ -667,7 +690,8 @@ mod win {
         ("&Edit", &[("&Copy\tCtrl+C", ID_COPY), ("Select &All\tCtrl+A", ID_SELECT_ALL), ("", 0), ("&Find...\tCtrl+F", ID_FIND), ("Find &Next\tF3", ID_FIND_NEXT), ("Find Pre&vious\tShift+F3", ID_FIND_PREV)]),
         ("&View", &[
             ("Zoom &In\tCtrl++", ID_ZOOM_IN), ("Zoom &Out\tCtrl+-", ID_ZOOM_OUT), ("&Actual Size\tCtrl+0", ID_ZOOM_RESET), ("", 0),
-            ("&Dark Mode\tCtrl+D", ID_DARK), ("Dark Mode &Text Color...", ID_DARK_TEXT), ("Dark Mode &Background Color...", ID_DARK_BG), ("&Reset Dark Mode Colors", ID_DARK_RESET),
+            ("&Dark Mode\tCtrl+D", ID_DARK), ("Dark Mode: &Match Windows", ID_DARK_FOLLOW),
+            ("Dark Mode &Text Color...", ID_DARK_TEXT), ("Dark Mode &Background Color...", ID_DARK_BG), ("&Reset Dark Mode Colors", ID_DARK_RESET),
         ]),
     ];
 
@@ -880,6 +904,84 @@ mod win {
         ReleaseDC(h, dc);
     }
 
+    /// Whether Windows is set to dark mode for apps (Settings > Colors >
+    /// "Choose your default app mode"). advapi32 is looked up at run time,
+    /// so the exe's imports don't change.
+    fn windows_dark() -> bool {
+        unsafe {
+            let Some(f) = optional("advapi32.dll", b"RegGetValueW\0") else { return false };
+            let get: unsafe extern "system" fn(isize, *const u16, *const u16, u32, *mut u32, *mut c_void, *mut u32) -> i32 = std::mem::transmute(f);
+            let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            let (mut light, mut size) = (1u32, 4u32);
+            // HKEY_CURRENT_USER, RRF_RT_REG_DWORD
+            let found = get(0x8000_0001u32 as i32 as isize, key.as_ptr(), wide("AppsUseLightTheme").as_ptr(), 0x10, null_mut(), &mut light as *mut _ as *mut c_void, &mut size) == 0;
+            found && light == 0
+        }
+    }
+
+    /// Whether the NUL-terminated wide string at `p` is `s` (reading at most s.len() + 1 units).
+    unsafe fn wstr_eq(p: *const u16, s: &str) -> bool {
+        s.encode_utf16().chain(Some(0)).enumerate().all(|(i, c)| *p.add(i) == c)
+    }
+
+    // ---- dark dropdown borders ----
+
+    /// Windows' own window procedure for menu windows (class "#32768").
+    static MENU_PROC: AtomicIsize = AtomicIsize::new(0);
+
+    /// A hook on this thread's window creation, to catch dropdown menus as
+    /// they open and paint their borders (which owner-drawing doesn't reach).
+    unsafe extern "system" fn cbt_hook(code: i32, w: usize, l: isize) -> isize {
+        if code == 3 { // HCBT_CREATEWND
+            let h = w as Hwnd;
+            let mut class = [0u16; 16];
+            let n = GetClassNameW(h, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+            if class[..n].iter().copied().eq("#32768".encode_utf16()) {
+                let ours = menu_proc as *const () as isize;
+                let old = SetWindowLongPtrW(h, -4, ours); // GWLP_WNDPROC
+                if old != ours {
+                    MENU_PROC.store(old, Ordering::Relaxed);
+                }
+            }
+        }
+        CallNextHookEx(0, code, w, l)
+    }
+
+    unsafe extern "system" fn menu_proc(h: Hwnd, m: u32, w: usize, l: isize) -> isize {
+        let r = CallWindowProcW(MENU_PROC.load(Ordering::Relaxed), h, m, w, l);
+        // WM_NCPAINT, or WM_PRINT of the frame (used for the fade-in)
+        let print = m == 0x0317 && l & 0x2 != 0; // PRF_NONCLIENT
+        if DARK.load(Ordering::Relaxed) && (m == 0x0085 || print) {
+            let dc = if print { w as isize } else { GetWindowDC(h) };
+            let (mut win, mut client) = (Rect::default(), Rect::default());
+            GetWindowRect(h, &mut win);
+            GetClientRect(h, &mut client);
+            let mut origin = [0i32; 2];
+            ClientToScreen(h, origin.as_mut_ptr());
+            // the frame: everything between the window's edge and its client area
+            let (cl, ct) = (origin[0] - win.left, origin[1] - win.top);
+            let (cr, cb) = (cl + client.right, ct + client.bottom);
+            let (ww, wh) = (win.right - win.left, win.bottom - win.top);
+            // like Windows' own: the menu's background, with a thin outer edge
+            let back = menu_colors().0;
+            let edge = mix(back, DARK_TEXT_COLOR.load(Ordering::Relaxed), 40);
+            for (inset, color) in [(0, edge), (1, back)] {
+                for strip in [
+                    Rect { left: inset, top: inset, right: ww - inset, bottom: ct },
+                    Rect { left: inset, top: cb, right: ww - inset, bottom: wh - inset },
+                    Rect { left: inset, top: ct, right: cl, bottom: cb },
+                    Rect { left: cr, top: ct, right: ww - inset, bottom: cb },
+                ] {
+                    fill(dc, &strip, color);
+                }
+            }
+            if !print {
+                ReleaseDC(h, dc);
+            }
+        }
+        r
+    }
+
     /// Let the user pick a dark mode color (text or background), then show dark mode with it.
     fn pick_color(color: &AtomicU32) {
         let mut custom = [0x00FF_FFFFu32; 16];
@@ -894,6 +996,7 @@ mod win {
         if unsafe { ChooseColorW(&mut cc) } != 0 {
             color.store(cc.result & 0xFF_FFFF, Ordering::Relaxed);
             DARK.store(true, Ordering::Relaxed);
+            FOLLOW_WINDOWS.store(false, Ordering::Relaxed);
             apply_theme();
         }
     }
@@ -1042,6 +1145,14 @@ mod win {
                 1
             }
             0x0120 if DARK.load(Ordering::Relaxed) => menu_char(w as u16, l), // WM_MENUCHAR
+            // Windows' light/dark app mode changed (Settings > Colors)
+            0x001A if FOLLOW_WINDOWS.load(Ordering::Relaxed) && l != 0 && wstr_eq(l as *const u16, "ImmersiveColorSet") => { // WM_SETTINGCHANGE
+                let dark = windows_dark();
+                if dark != DARK.swap(dark, Ordering::Relaxed) {
+                    apply_theme();
+                }
+                0
+            }
             0x0085 | 0x0086 => { // WM_NCPAINT, WM_NCACTIVATE
                 let r = DefWindowProcW(h, m, w, l);
                 if DARK.load(Ordering::Relaxed) {
@@ -1068,7 +1179,13 @@ mod win {
                     ID_ZOOM_IN => step_zoom(1),
                     ID_ZOOM_OUT => step_zoom(-1),
                     ID_ZOOM_RESET => set_zoom(100),
+                    ID_DARK_FOLLOW => {
+                        FOLLOW_WINDOWS.store(true, Ordering::Relaxed);
+                        DARK.store(windows_dark(), Ordering::Relaxed);
+                        apply_theme();
+                    }
                     ID_DARK => {
+                        FOLLOW_WINDOWS.store(false, Ordering::Relaxed);
                         DARK.fetch_xor(true, Ordering::Relaxed);
                         apply_theme();
                     }
@@ -1150,6 +1267,7 @@ mod win {
                 work.left + (ww - w) / 2, work.top + (wh - h) / 2, w, h,
                 0, bar, inst, null());
             WIN.store(win, Ordering::Relaxed);
+            SetWindowsHookExW(5, cbt_hook, 0, GetCurrentThreadId()); // WH_CBT, this thread only
             let edit = CreateWindowExW(
                 0, wide("RICHEDIT50W").as_ptr(), wide("").as_ptr(),
                 // child visible vscroll multiline readonly autovscroll nohidesel
@@ -1159,9 +1277,11 @@ mod win {
             SendMessageW(edit, EM_EXLIMITTEXT, 0, 0x7FFF_FFFF);
 
             let saved = load_settings();
+            let chosen = saved.as_ref().and_then(|s| s.dark);
+            FOLLOW_WINDOWS.store(chosen.is_none(), Ordering::Relaxed);
+            DARK.store(chosen.unwrap_or_else(windows_dark), Ordering::Relaxed);
             if let Some(s) = &saved {
                 set_zoom(s.zoom);
-                DARK.store(s.dark, Ordering::Relaxed);
                 if let Some((fg, bg)) = s.colors {
                     DARK_TEXT_COLOR.store(fg, Ordering::Relaxed);
                     DARK_BG_COLOR.store(bg, Ordering::Relaxed);

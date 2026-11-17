@@ -14,7 +14,7 @@ Download `word-viewer.exe` from [Releases](../../releases), then open a document
 - Find: Ctrl+F, then F3 / Shift+F3 for the next / previous match
 - Zoom: Ctrl+Plus, Ctrl+Minus, Ctrl+0 (or Ctrl+mouse wheel)
 - Print: Ctrl+P
-- Dark mode: Ctrl+D; its text and background colors can be changed in the View menu
+- Dark mode: follows Windows' app mode until you choose with Ctrl+D (View → Dark Mode: Match Windows goes back to following it); its text and background colors can be changed in the View menu
 
 The window remembers its size, position, zoom and dark mode (with its colors) in `%LOCALAPPDATA%\word-viewer\window.txt`; nothing about the documents you open is stored.
 
