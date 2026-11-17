@@ -191,6 +191,65 @@ mod win {
     }
 
     #[repr(C)]
+    struct MenuInfo {
+        size: u32,
+        mask: u32,
+        style: u32,
+        max_height: u32,
+        back: isize,
+        help_id: u32,
+        data: usize,
+    }
+
+    #[repr(C)]
+    struct MenuItemInfo {
+        size: u32,
+        mask: u32,
+        ftype: u32,
+        state: u32,
+        id: u32,
+        submenu: isize,
+        checked: isize,
+        unchecked: isize,
+        data: usize,
+        type_data: *mut u16,
+        cch: u32,
+        item_bitmap: isize,
+    }
+
+    #[repr(C)]
+    struct MeasureItem {
+        ctl_type: u32,
+        ctl_id: u32,
+        item_id: u32,
+        width: u32,
+        height: u32,
+        data: usize,
+    }
+
+    #[repr(C)]
+    struct DrawItem {
+        ctl_type: u32,
+        ctl_id: u32,
+        item_id: u32,
+        action: u32,
+        state: u32,
+        item: isize,
+        dc: isize,
+        rc: Rect,
+        data: usize,
+    }
+
+    #[repr(C)]
+    struct MenuBarInfo {
+        size: u32,
+        bar: Rect,
+        menu: isize,
+        menu_window: Hwnd,
+        flags: u32,
+    }
+
+    #[repr(C)]
     struct CharFormat {
         size: u32,
         mask: u32,
@@ -254,6 +313,20 @@ mod win {
         fn SetWindowPos(h: Hwnd, after: Hwnd, x: i32, y: i32, w: i32, h_: i32, flags: u32) -> i32;
         fn MessageBeep(kind: u32) -> i32;
         fn GetWindowPlacement(h: Hwnd, wp: *mut WindowPlacement) -> i32;
+        fn GetMenu(h: Hwnd) -> isize;
+        fn SetMenuInfo(menu: isize, mi: *const MenuInfo) -> i32;
+        fn GetMenuItemCount(menu: isize) -> i32;
+        fn GetMenuItemInfoW(menu: isize, item: u32, by_position: i32, mi: *mut MenuItemInfo) -> i32;
+        fn SetMenu(h: Hwnd, menu: isize) -> i32;
+        fn GetActiveWindow() -> Hwnd;
+        fn DestroyMenu(menu: isize) -> i32;
+        fn GetMenuBarInfo(h: Hwnd, object: i32, item: i32, mbi: *mut MenuBarInfo) -> i32;
+        fn GetWindowRect(h: Hwnd, r: *mut Rect) -> i32;
+        fn GetDC(h: Hwnd) -> isize;
+        fn GetWindowDC(h: Hwnd) -> isize;
+        fn ReleaseDC(h: Hwnd, dc: isize) -> i32;
+        fn FillRect(dc: isize, r: *const Rect, brush: isize) -> i32;
+        fn DrawTextW(dc: isize, s: *const u16, n: i32, r: *mut Rect, format: u32) -> i32;
         fn SetWindowPlacement(h: Hwnd, wp: *const WindowPlacement) -> i32;
         fn SystemParametersInfoW(action: u32, uparam: u32, pparam: *mut c_void, winini: u32) -> i32;
         fn LoadCursorW(inst: isize, name: usize) -> isize;
@@ -287,6 +360,12 @@ mod win {
         fn EndDoc(dc: isize) -> i32;
         fn AbortDoc(dc: isize) -> i32;
         fn DeleteDC(dc: isize) -> i32;
+        fn CreateSolidBrush(color: u32) -> isize;
+        fn CreateFontIndirectW(lf: *const c_void) -> isize;
+        fn DeleteObject(obj: isize) -> i32;
+        fn SelectObject(dc: isize, obj: isize) -> isize;
+        fn SetTextColor(dc: isize, color: u32) -> u32;
+        fn SetBkMode(dc: isize, mode: i32) -> i32;
     }
 
     const WM_DESTROY: u32 = 0x0002;
@@ -548,6 +627,11 @@ mod win {
                 }
                 // redraw the frame: SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED
                 SetWindowPos(win, 0, 0, 0, 0, 0, 0x1 | 0x2 | 0x4 | 0x20);
+                // Windows 10 repaints the title bar only when the window's
+                // active state changes: flip it and back
+                let active = (GetActiveWindow() == win) as usize;
+                SendMessageW(win, 0x0086, active ^ 1, 0); // WM_NCACTIVATE
+                SendMessageW(win, 0x0086, active, 0);
             }
             // a dark scroll bar
             if let Some(f) = optional("uxtheme.dll", b"SetWindowTheme\0") {
@@ -555,8 +639,245 @@ mod win {
                 let theme = wide("DarkMode_Explorer");
                 set(edit(), if dark { theme.as_ptr() } else { null() }, null());
             }
+            // the menus: drawn by the viewer in dark mode (Windows 10 has no dark menus)
+            let old_menu = GetMenu(win);
+            let bar = build_menu(dark);
+            let brush = if dark { CreateSolidBrush(menu_colors().0) } else { 0 };
+            if dark {
+                let info = MenuInfo { size: std::mem::size_of::<MenuInfo>() as u32, mask: 0x2 | 0x8000_0000, back: brush, ..std::mem::zeroed() }; // MIM_BACKGROUND | MIM_APPLYTOSUBMENUS
+                SetMenuInfo(bar, &info);
+            }
             CheckMenuItem(VIEW_MENU.load(Ordering::Relaxed), ID_DARK as u32, if dark { 0x8 } else { 0 }); // MF_CHECKED
+            SetMenu(win, bar);
+            if old_menu != 0 {
+                DestroyMenu(old_menu);
+            }
+            let old_brush = MENU_BRUSH.swap(brush, Ordering::Relaxed);
+            if old_brush != 0 {
+                DeleteObject(old_brush);
+            }
         }
+    }
+
+    // ---- dark menus ----
+
+    /// The menus: each title, and its items' text and command ("" is a separator).
+    const MENUS: [(&str, &[(&str, usize)]); 3] = [
+        ("&File", &[("&Open...\tCtrl+O", ID_OPEN), ("&Print...\tCtrl+P", ID_PRINT), ("", 0), ("E&xit", ID_EXIT)]),
+        ("&Edit", &[("&Copy\tCtrl+C", ID_COPY), ("Select &All\tCtrl+A", ID_SELECT_ALL), ("", 0), ("&Find...\tCtrl+F", ID_FIND), ("Find &Next\tF3", ID_FIND_NEXT), ("Find Pre&vious\tShift+F3", ID_FIND_PREV)]),
+        ("&View", &[
+            ("Zoom &In\tCtrl++", ID_ZOOM_IN), ("Zoom &Out\tCtrl+-", ID_ZOOM_OUT), ("&Actual Size\tCtrl+0", ID_ZOOM_RESET), ("", 0),
+            ("&Dark Mode\tCtrl+D", ID_DARK), ("Dark Mode &Text Color...", ID_DARK_TEXT), ("Dark Mode &Background Color...", ID_DARK_BG), ("&Reset Dark Mode Colors", ID_DARK_RESET),
+        ]),
+    ];
+
+    /// Build the menu bar: ordinary menus, or in dark mode owner-drawn ones
+    /// whose item data is an index (from 1) into MENU_TEXT.
+    unsafe fn build_menu(dark: bool) -> isize {
+        const MF_SEPARATOR: u32 = 0x800;
+        const MF_POPUP: u32 = 0x10;
+        const MF_OWNERDRAW: u32 = 0x100;
+        let mut texts = MENU_TEXT.lock().unwrap_or_else(|e| e.into_inner());
+        let fill = texts.is_empty(); // the same items every time: list them once
+        let mut add = |text: &str, top: bool| -> *const u16 {
+            if fill {
+                texts.push(MenuText { text: text.encode_utf16().collect(), top, separator: text.is_empty() });
+            }
+            let n = texts.iter().position(|t| t.top == top && t.text.iter().copied().eq(text.encode_utf16())).map_or(0, |i| i + 1);
+            n as *const u16
+        };
+        let bar = CreateMenu();
+        for (title, items) in MENUS {
+            let popup = CreatePopupMenu();
+            for &(text, id) in items {
+                let sep = if text.is_empty() { MF_SEPARATOR } else { 0 };
+                if dark {
+                    AppendMenuW(popup, MF_OWNERDRAW | sep, id, add(text, false));
+                } else if text.is_empty() {
+                    AppendMenuW(popup, sep, 0, null());
+                } else {
+                    AppendMenuW(popup, 0, id, wide(text).as_ptr());
+                }
+            }
+            if title == "&View" {
+                VIEW_MENU.store(popup, Ordering::Relaxed);
+            }
+            if dark {
+                AppendMenuW(bar, MF_POPUP | MF_OWNERDRAW, popup as usize, add(title, true));
+            } else {
+                AppendMenuW(bar, MF_POPUP, popup as usize, wide(title).as_ptr());
+            }
+        }
+        bar
+    }
+
+    /// Owner-drawn items have no text Windows can see, so it asks for their
+    /// mnemonics (Alt+F, then O...): the item whose "&" letter is `ch`.
+    unsafe fn menu_char(ch: u16, menu: isize) -> isize {
+        let ch = char::from_u32(ch as u32).map(|c| c.to_ascii_lowercase());
+        for i in 0..GetMenuItemCount(menu).max(0) {
+            let mut mi = MenuItemInfo { size: std::mem::size_of::<MenuItemInfo>() as u32, mask: 0x20, ..std::mem::zeroed() }; // MIIM_DATA
+            GetMenuItemInfoW(menu, i as u32, 1, &mut mi);
+            let Some(t) = menu_text(mi.data) else { continue };
+            let key = t.text.iter().position(|&c| c == '&' as u16).and_then(|p| t.text.get(p + 1)).and_then(|&c| char::from_u32(c as u32));
+            if key.map(|c| c.to_ascii_lowercase()) == ch {
+                return (2 << 16) | i as isize; // MNC_EXECUTE, item index
+            }
+        }
+        0 // MNC_IGNORE
+    }
+
+    /// A menu item's text in dark mode, where the menus are owner-drawn.
+    #[derive(Clone)]
+    struct MenuText {
+        text: Vec<u16>,
+        top: bool,
+        separator: bool,
+    }
+
+    static MENU_TEXT: std::sync::Mutex<Vec<MenuText>> = std::sync::Mutex::new(Vec::new());
+    static MENU_BRUSH: AtomicIsize = AtomicIsize::new(0);
+    static MENU_FONT: AtomicIsize = AtomicIsize::new(0);
+
+    fn menu_text(index: usize) -> Option<MenuText> {
+        MENU_TEXT.lock().unwrap_or_else(|e| e.into_inner()).get(index.checked_sub(1)?).cloned()
+    }
+
+    /// `a` blended toward `b` by `t`/256, per channel.
+    fn mix(a: u32, b: u32, t: u32) -> u32 {
+        (0..3).map(|i| ((((a >> (i * 8)) & 0xFF) * (256 - t) + ((b >> (i * 8)) & 0xFF) * t) / 256) << (i * 8)).sum()
+    }
+
+    /// Menu background, highlighted item, text, and separator colors, from dark mode's colors.
+    fn menu_colors() -> (u32, u32, u32, u32) {
+        let (fg, bg) = (DARK_TEXT_COLOR.load(Ordering::Relaxed), DARK_BG_COLOR.load(Ordering::Relaxed));
+        (mix(bg, fg, 20), mix(bg, fg, 56), fg, mix(bg, fg, 80))
+    }
+
+    /// The menu font: Windows' own, as set in Settings.
+    unsafe fn menu_font() -> isize {
+        let mut f = MENU_FONT.load(Ordering::Relaxed);
+        if f == 0 {
+            // NONCLIENTMETRICSW (504 bytes), whose lfMenuFont is at byte 224
+            let mut ncm = [0u32; 126];
+            ncm[0] = 504;
+            if SystemParametersInfoW(0x0029, 504, ncm.as_mut_ptr() as *mut c_void, 0) != 0 { // SPI_GETNONCLIENTMETRICS
+                f = CreateFontIndirectW(ncm.as_ptr().add(224 / 4) as *const c_void);
+            }
+            MENU_FONT.store(f, Ordering::Relaxed);
+        }
+        f
+    }
+
+    unsafe fn fill(dc: isize, r: &Rect, color: u32) {
+        let b = CreateSolidBrush(color);
+        FillRect(dc, r, b);
+        DeleteObject(b);
+    }
+
+    /// The label and the shortcut ("&Open...\tCtrl+O").
+    fn split_tab(text: &[u16]) -> (&[u16], &[u16]) {
+        match text.iter().position(|&c| c == '\t' as u16) {
+            Some(i) => (&text[..i], &text[i + 1..]),
+            None => (text, &[]),
+        }
+    }
+
+    const DT_CENTER: u32 = 0x1;
+    const DT_RIGHT: u32 = 0x2;
+    const DT_VCENTER: u32 = 0x4;
+    const DT_SINGLELINE: u32 = 0x20;
+    const DT_CALCRECT: u32 = 0x400;
+    const DT_HIDEPREFIX: u32 = 0x10_0000;
+
+    /// DrawTextW, for a slice. An empty one is skipped: its pointer is only a
+    /// placeholder, which DrawTextW reads even when told the length is 0.
+    unsafe fn draw_text(dc: isize, s: &[u16], r: &mut Rect, format: u32) -> i32 {
+        if s.is_empty() {
+            return 0;
+        }
+        DrawTextW(dc, s.as_ptr(), s.len() as i32, r, format)
+    }
+
+    unsafe fn text_width(dc: isize, s: &[u16]) -> i32 {
+        let mut r = Rect::default();
+        draw_text(dc, s, &mut r, DT_SINGLELINE | DT_CALCRECT);
+        r.right - r.left
+    }
+
+    unsafe fn measure_menu(m: &mut MeasureItem) {
+        let Some(t) = menu_text(m.data) else { return };
+        if t.separator {
+            (m.width, m.height) = (0, scaled(7) as u32);
+            return;
+        }
+        let win = WIN.load(Ordering::Relaxed);
+        let dc = GetDC(win);
+        let old = SelectObject(dc, menu_font());
+        let (label, keys) = split_tab(&t.text);
+        let (lw, kw) = (text_width(dc, label), text_width(dc, keys));
+        let mut probe = Rect::default();
+        let h = DrawTextW(dc, wide("Ag").as_ptr(), 2, &mut probe, DT_SINGLELINE | DT_CALCRECT);
+        SelectObject(dc, old);
+        ReleaseDC(win, dc);
+        if t.top {
+            (m.width, m.height) = ((lw + scaled(4)) as u32, h as u32);
+        } else {
+            let gap = if kw > 0 { scaled(32) + kw } else { 0 };
+            (m.width, m.height) = ((scaled(28) + lw + gap + scaled(12)) as u32, (h + scaled(8)) as u32);
+        }
+    }
+
+    unsafe fn draw_menu(d: &DrawItem) {
+        let Some(t) = menu_text(d.data) else { return };
+        let (back, hot, fg, line) = menu_colors();
+        const SELECTED: u32 = 0x1;
+        const GRAYED: u32 = 0x2 | 0x4;
+        const CHECKED: u32 = 0x8;
+        const NOACCEL: u32 = 0x100;
+        const HOTLIGHT: u32 = 0x40;
+        let r = d.rc;
+        if t.separator {
+            fill(d.dc, &r, back);
+            let mid = (r.top + r.bottom) / 2;
+            fill(d.dc, &Rect { left: r.left + scaled(8), top: mid, right: r.right - scaled(8), bottom: mid + 1 }, line);
+            return;
+        }
+        fill(d.dc, &r, if d.state & (SELECTED | HOTLIGHT) != 0 { hot } else { back });
+        SetBkMode(d.dc, 1); // TRANSPARENT
+        SetTextColor(d.dc, if d.state & GRAYED != 0 { mix(fg, back, 128) } else { fg });
+        let old = SelectObject(d.dc, menu_font());
+        let prefix = if d.state & NOACCEL != 0 { DT_HIDEPREFIX } else { 0 };
+        let (label, keys) = split_tab(&t.text);
+        let mut rc = r;
+        if t.top {
+            draw_text(d.dc, label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | prefix);
+        } else {
+            if d.state & CHECKED != 0 {
+                let mut c = Rect { right: r.left + scaled(28), ..r };
+                DrawTextW(d.dc, wide("\u{2713}").as_ptr(), 1, &mut c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            rc.left += scaled(28);
+            rc.right -= scaled(12);
+            draw_text(d.dc, label, &mut rc, DT_VCENTER | DT_SINGLELINE | prefix);
+            draw_text(d.dc, keys, &mut rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+        SelectObject(d.dc, old);
+    }
+
+    /// Windows draws a light line under the menu bar, outside what the menu
+    /// draws; paint over it in dark mode.
+    unsafe fn menu_bar_line(h: Hwnd) {
+        let mut mb = MenuBarInfo { size: std::mem::size_of::<MenuBarInfo>() as u32, ..std::mem::zeroed() };
+        if GetMenuBarInfo(h, -3, 0, &mut mb) == 0 { // OBJID_MENU
+            return;
+        }
+        let mut w = Rect::default();
+        GetWindowRect(h, &mut w);
+        let line = Rect { left: mb.bar.left - w.left, top: mb.bar.bottom - w.top, right: mb.bar.right - w.left, bottom: mb.bar.bottom - w.top + 1 };
+        let dc = GetWindowDC(h);
+        fill(dc, &line, menu_colors().0);
+        ReleaseDC(h, dc);
     }
 
     /// Let the user pick a dark mode color (text or background), then show dark mode with it.
@@ -711,6 +1032,23 @@ mod win {
                 SetFocus(edit());
                 0
             }
+            // dark mode's owner-drawn menus (ODT_MENU)
+            0x002C if (*(l as *const MeasureItem)).ctl_type == 1 => { // WM_MEASUREITEM
+                measure_menu(&mut *(l as *mut MeasureItem));
+                1
+            }
+            0x002B if (*(l as *const DrawItem)).ctl_type == 1 => { // WM_DRAWITEM
+                draw_menu(&*(l as *const DrawItem));
+                1
+            }
+            0x0120 if DARK.load(Ordering::Relaxed) => menu_char(w as u16, l), // WM_MENUCHAR
+            0x0085 | 0x0086 => { // WM_NCPAINT, WM_NCACTIVATE
+                let r = DefWindowProcW(h, m, w, l);
+                if DARK.load(Ordering::Relaxed) {
+                    menu_bar_line(h);
+                }
+                r
+            }
             WM_COMMAND => {
                 match w & 0xFFFF {
                     ID_OPEN => open_dialog(),
@@ -772,18 +1110,6 @@ mod win {
         }
     }
 
-    unsafe fn menu(items: &[(&str, usize)]) -> isize {
-        let m = CreatePopupMenu();
-        for &(text, id) in items {
-            if text.is_empty() {
-                AppendMenuW(m, 0x0800, 0, null()); // MF_SEPARATOR
-            } else {
-                AppendMenuW(m, 0, id, wide(text).as_ptr());
-            }
-        }
-        m
-    }
-
     pub fn run() {
         unsafe {
             // Only load DLLs from System32, never from the exe's folder (e.g. Downloads).
@@ -809,21 +1135,7 @@ mod win {
             };
             RegisterClassW(&wc);
 
-            let bar = CreateMenu();
-            for (title, items) in [
-                ("&File", &[("&Open...\tCtrl+O", ID_OPEN), ("&Print...\tCtrl+P", ID_PRINT), ("", 0), ("E&xit", ID_EXIT)][..]),
-                ("&Edit", &[("&Copy\tCtrl+C", ID_COPY), ("Select &All\tCtrl+A", ID_SELECT_ALL), ("", 0), ("&Find...\tCtrl+F", ID_FIND), ("Find &Next\tF3", ID_FIND_NEXT), ("Find Pre&vious\tShift+F3", ID_FIND_PREV)][..]),
-                ("&View", &[
-                    ("Zoom &In\tCtrl++", ID_ZOOM_IN), ("Zoom &Out\tCtrl+-", ID_ZOOM_OUT), ("&Actual Size\tCtrl+0", ID_ZOOM_RESET), ("", 0),
-                    ("&Dark Mode\tCtrl+D", ID_DARK), ("Dark Mode &Text Color...", ID_DARK_TEXT), ("Dark Mode &Background Color...", ID_DARK_BG), ("&Reset Dark Mode Colors", ID_DARK_RESET),
-                ][..]),
-            ] {
-                let m = menu(items);
-                if title == "&View" {
-                    VIEW_MENU.store(m, Ordering::Relaxed);
-                }
-                AppendMenuW(bar, 0x0010, m as usize, wide(title).as_ptr()); // MF_POPUP
-            }
+            let bar = build_menu(false); // apply_theme rebuilds it for dark mode
 
             // Default size: 1000 x 1150 at 100% scaling, fitted to the work area and centered.
             let mut work = Rect::default();
