@@ -25,7 +25,7 @@ mod win {
     use std::io::Read;
     use std::os::windows::ffi::OsStringExt;
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU32, Ordering};
 
     type Hwnd = isize;
     type WndProc = unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize;
@@ -190,11 +190,38 @@ mod win {
         codepage: u32,
     }
 
+    #[repr(C)]
+    struct CharFormat {
+        size: u32,
+        mask: u32,
+        effects: u32,
+        height: i32,
+        offset: i32,
+        color: u32,
+        charset: u8,
+        pitch_and_family: u8,
+        face: [u16; 32],
+    }
+
+    #[repr(C)]
+    struct ChooseColor {
+        size: u32,
+        owner: Hwnd,
+        instance: isize,
+        result: u32,
+        custom: *mut u32,
+        flags: u32,
+        cust_data: isize,
+        hook: *const c_void,
+        template_name: *const u16,
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn SetDefaultDllDirectories(flags: u32) -> i32;
         fn LoadLibraryExW(name: *const u16, file: isize, flags: u32) -> isize;
         fn GetModuleHandleW(name: *const u16) -> isize;
+        fn GetProcAddress(module: isize, name: *const u8) -> *const c_void;
         fn GetCommandLineW() -> *const u16;
         fn LocalFree(mem: *mut c_void) -> *mut c_void;
         fn GlobalFree(mem: isize) -> isize;
@@ -223,6 +250,8 @@ mod win {
         fn SetWindowTextW(h: Hwnd, s: *const u16) -> i32;
         fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
         fn SetFocus(h: Hwnd) -> Hwnd;
+        fn CheckMenuItem(menu: isize, id: u32, check: u32) -> u32;
+        fn SetWindowPos(h: Hwnd, after: Hwnd, x: i32, y: i32, w: i32, h_: i32, flags: u32) -> i32;
         fn MessageBeep(kind: u32) -> i32;
         fn GetWindowPlacement(h: Hwnd, wp: *mut WindowPlacement) -> i32;
         fn SetWindowPlacement(h: Hwnd, wp: *const WindowPlacement) -> i32;
@@ -246,6 +275,7 @@ mod win {
         fn GetOpenFileNameW(ofn: *mut OpenFileName) -> i32;
         fn FindTextW(fr: *mut FindReplace) -> Hwnd;
         fn PrintDlgW(pd: *mut PrintDlg) -> i32;
+        fn ChooseColorW(cc: *mut ChooseColor) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -293,6 +323,14 @@ mod win {
     const ID_ZOOM_IN: usize = 9;
     const ID_ZOOM_OUT: usize = 10;
     const ID_ZOOM_RESET: usize = 11;
+    const ID_DARK: usize = 12;
+    const ID_DARK_TEXT: usize = 13;
+    const ID_DARK_BG: usize = 14;
+    const ID_DARK_RESET: usize = 15;
+    /// Dark mode colors (COLORREF, 0x00BBGGRR): Windows Terminal's default
+    /// "Campbell" scheme, background #0C0C0C and text #CCCCCC.
+    const DARK_BG: u32 = 0x000C_0C0C;
+    const DARK_TEXT: u32 = 0x00CC_CCCC;
     const MAX_PATH: usize = 260;
     /// Zoom steps, in percent.
     const ZOOMS: [u32; 13] = [50, 67, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400];
@@ -303,6 +341,10 @@ mod win {
     static FIND_MSG: AtomicU32 = AtomicU32::new(0);
     /// The find dialog's state, which must outlive the (modeless) dialog.
     static FIND: AtomicPtr<Find> = AtomicPtr::new(null_mut());
+    static DARK: AtomicBool = AtomicBool::new(false);
+    static DARK_TEXT_COLOR: AtomicU32 = AtomicU32::new(DARK_TEXT);
+    static DARK_BG_COLOR: AtomicU32 = AtomicU32::new(DARK_BG);
+    static VIEW_MENU: AtomicIsize = AtomicIsize::new(0);
 
     struct Find {
         fr: FindReplace,
@@ -328,7 +370,7 @@ mod win {
         px * dpi / 96
     }
 
-    // ---- remembered settings: window placement and zoom ----
+    // ---- remembered settings: window placement, zoom and dark mode ----
 
     /// %LOCALAPPDATA%\word-viewer\window.txt. Only the window's own settings
     /// are kept; never anything about documents.
@@ -336,14 +378,30 @@ mod win {
         Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("word-viewer").join("window.txt"))
     }
 
-    /// Saved normal-window rectangle, whether it was maximized, and zoom percent.
-    fn load_settings() -> Option<(Rect, bool, u32)> {
+    struct Settings {
+        /// The window's normal (not maximized) rectangle.
+        normal: Rect,
+        maximized: bool,
+        zoom: u32,
+        dark: bool,
+        /// Dark mode's text and background colors.
+        colors: Option<(u32, u32)>,
+    }
+
+    fn load_settings() -> Option<Settings> {
         let mut s = String::new();
         File::open(settings_path()?).ok()?.take(256).read_to_string(&mut s).ok()?;
-        let v: Vec<i32> = s.split_whitespace().map(|x| x.parse().ok()).collect::<Option<_>>()?;
-        let [l, t, r, b, max, zoom] = v[..] else { return None };
+        let v: Vec<i64> = s.split_whitespace().map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        let &[l, t, r, b, max, zoom] = v.get(..6)? else { return None };
+        let [l, t, r, b] = [l, t, r, b].map(|x| x.clamp(-100_000, 100_000) as i32);
+        // later fields were added over time: dark mode, then its colors
+        let dark = v.get(6).is_some_and(|&d| d != 0);
+        let colors = match v.get(7..9) {
+            Some(&[fg, bg]) => Some(((fg & 0xFF_FFFF) as u32, (bg & 0xFF_FFFF) as u32)),
+            _ => None,
+        };
         let ok = r - l >= 200 && b - t >= 150 && r - l <= 32767 && b - t <= 32767;
-        ok.then_some((Rect { left: l, top: t, right: r, bottom: b }, max != 0, zoom.clamp(10, 500) as u32))
+        ok.then_some(Settings { normal: Rect { left: l, top: t, right: r, bottom: b }, maximized: max != 0, zoom: zoom.clamp(10, 500) as u32, dark, colors })
     }
 
     fn save_settings() {
@@ -353,7 +411,9 @@ mod win {
             return;
         }
         let n = wp.normal;
-        let line = format!("{} {} {} {} {} {}\n", n.left, n.top, n.right, n.bottom, (wp.show_cmd == 3) as u8, zoom());
+        let dark = DARK.load(Ordering::Relaxed) as u8;
+        let (fg, bg) = (DARK_TEXT_COLOR.load(Ordering::Relaxed), DARK_BG_COLOR.load(Ordering::Relaxed));
+        let line = format!("{} {} {} {} {} {} {dark} {fg} {bg}\n", n.left, n.top, n.right, n.bottom, (wp.show_cmd == 3) as u8, zoom());
         if let Some(path) = settings_path() {
             let _ = path.parent().map(std::fs::create_dir_all);
             let _ = std::fs::write(path, line);
@@ -371,6 +431,10 @@ mod win {
             SendMessageW(edit(), EM_SETTEXTEX, &st as *const _ as usize, buf.as_ptr() as isize);
             SendMessageW(edit(), EM_SETSEL, 0, 0);
             SendMessageW(edit(), EM_SCROLLCARET, 0, 0);
+        }
+        // new text has the default (automatic) color
+        if DARK.load(Ordering::Relaxed) {
+            text_color(Some(DARK_TEXT_COLOR.load(Ordering::Relaxed)));
         }
         set_zoom(z);
     }
@@ -442,6 +506,74 @@ mod win {
         let next = if dir > 0 { ZOOMS.iter().find(|&&s| s > z) } else { ZOOMS.iter().rev().find(|&&s| s < z) };
         if let Some(&s) = next {
             set_zoom(s);
+        }
+    }
+
+    // ---- dark mode ----
+
+    /// Set all text to `color`, or back to the automatic (system) color.
+    /// Documents never set text colors, so this loses nothing.
+    fn text_color(color: Option<u32>) {
+        let mut cf: CharFormat = unsafe { std::mem::zeroed() };
+        cf.size = std::mem::size_of::<CharFormat>() as u32;
+        cf.mask = 0x4000_0000; // CFM_COLOR
+        match color {
+            Some(c) => cf.color = c,
+            None => cf.effects = 0x4000_0000, // CFE_AUTOCOLOR
+        }
+        unsafe { SendMessageW(edit(), 0x0444, 4, &cf as *const _ as isize) }; // EM_SETCHARFORMAT, SCF_ALL
+    }
+
+    /// Function `name` from a System32 DLL, if it has one (older Windows may not).
+    unsafe fn optional(dll: &str, name: &[u8]) -> Option<*const c_void> {
+        let m = LoadLibraryExW(wide(dll).as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        let f = if m == 0 { null() } else { GetProcAddress(m, name.as_ptr()) };
+        (!f.is_null()).then_some(f)
+    }
+
+    /// Show the current mode: colors, title bar, scroll bar and the menu check.
+    fn apply_theme() {
+        let dark = DARK.load(Ordering::Relaxed);
+        let win = WIN.load(Ordering::Relaxed);
+        unsafe {
+            // EM_SETBKGNDCOLOR: wParam 1 is the system color
+            SendMessageW(edit(), 0x0443, !dark as usize, DARK_BG_COLOR.load(Ordering::Relaxed) as isize);
+            text_color(dark.then(|| DARK_TEXT_COLOR.load(Ordering::Relaxed)));
+            // a dark title bar (Windows 10 20H1+; 19 on 1809 to 1909)
+            if let Some(f) = optional("dwmapi.dll", b"DwmSetWindowAttribute\0") {
+                let set: unsafe extern "system" fn(Hwnd, u32, *const c_void, u32) -> i32 = std::mem::transmute(f);
+                let on = dark as i32;
+                if set(win, 20, &on as *const _ as *const c_void, 4) != 0 {
+                    set(win, 19, &on as *const _ as *const c_void, 4);
+                }
+                // redraw the frame: SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED
+                SetWindowPos(win, 0, 0, 0, 0, 0, 0x1 | 0x2 | 0x4 | 0x20);
+            }
+            // a dark scroll bar
+            if let Some(f) = optional("uxtheme.dll", b"SetWindowTheme\0") {
+                let set: unsafe extern "system" fn(Hwnd, *const u16, *const u16) -> i32 = std::mem::transmute(f);
+                let theme = wide("DarkMode_Explorer");
+                set(edit(), if dark { theme.as_ptr() } else { null() }, null());
+            }
+            CheckMenuItem(VIEW_MENU.load(Ordering::Relaxed), ID_DARK as u32, if dark { 0x8 } else { 0 }); // MF_CHECKED
+        }
+    }
+
+    /// Let the user pick a dark mode color (text or background), then show dark mode with it.
+    fn pick_color(color: &AtomicU32) {
+        let mut custom = [0x00FF_FFFFu32; 16];
+        custom[0] = DARK_TEXT;
+        custom[1] = DARK_BG;
+        let mut cc: ChooseColor = unsafe { std::mem::zeroed() };
+        cc.size = std::mem::size_of::<ChooseColor>() as u32;
+        cc.owner = WIN.load(Ordering::Relaxed);
+        cc.result = color.load(Ordering::Relaxed);
+        cc.custom = custom.as_mut_ptr();
+        cc.flags = 0x1 | 0x2; // CC_RGBINIT | CC_FULLOPEN
+        if unsafe { ChooseColorW(&mut cc) } != 0 {
+            color.store(cc.result & 0xFF_FFFF, Ordering::Relaxed);
+            DARK.store(true, Ordering::Relaxed);
+            apply_theme();
         }
     }
 
@@ -531,6 +663,10 @@ mod win {
             let di = DocInfo { size: std::mem::size_of::<DocInfo>() as i32, name: if n > 0 { title.as_ptr() } else { null() }, output: null(), datatype: null(), kind: 0 };
             let tl = TextLengthEx { flags: 0, codepage: 1200 };
             let len = SendMessageW(edit(), EM_GETTEXTLENGTHEX, &tl as *const _ as usize, 0) as i32;
+            let dark = DARK.load(Ordering::Relaxed);
+            if dark {
+                text_color(None); // print dark mode's light text as black
+            }
             if rc.right > rc.left && rc.bottom > rc.top && StartDocW(dc, &di) > 0 {
                 let mut fr = FormatRange { dc, target: dc, rc, page, chrg: CharRange { min: 0, max: -1 } };
                 let mut ok = true;
@@ -550,6 +686,9 @@ mod win {
                 } else {
                     AbortDoc(dc);
                 }
+            }
+            if dark {
+                text_color(Some(DARK_TEXT_COLOR.load(Ordering::Relaxed)));
             }
             DeleteDC(dc);
             GlobalFree(pd.dev_mode);
@@ -591,6 +730,17 @@ mod win {
                     ID_ZOOM_IN => step_zoom(1),
                     ID_ZOOM_OUT => step_zoom(-1),
                     ID_ZOOM_RESET => set_zoom(100),
+                    ID_DARK => {
+                        DARK.fetch_xor(true, Ordering::Relaxed);
+                        apply_theme();
+                    }
+                    ID_DARK_TEXT => pick_color(&DARK_TEXT_COLOR),
+                    ID_DARK_BG => pick_color(&DARK_BG_COLOR),
+                    ID_DARK_RESET => {
+                        DARK_TEXT_COLOR.store(DARK_TEXT, Ordering::Relaxed);
+                        DARK_BG_COLOR.store(DARK_BG, Ordering::Relaxed);
+                        apply_theme();
+                    }
                     _ => {}
                 }
                 0
@@ -663,9 +813,16 @@ mod win {
             for (title, items) in [
                 ("&File", &[("&Open...\tCtrl+O", ID_OPEN), ("&Print...\tCtrl+P", ID_PRINT), ("", 0), ("E&xit", ID_EXIT)][..]),
                 ("&Edit", &[("&Copy\tCtrl+C", ID_COPY), ("Select &All\tCtrl+A", ID_SELECT_ALL), ("", 0), ("&Find...\tCtrl+F", ID_FIND), ("Find &Next\tF3", ID_FIND_NEXT), ("Find Pre&vious\tShift+F3", ID_FIND_PREV)][..]),
-                ("&View", &[("Zoom &In\tCtrl++", ID_ZOOM_IN), ("Zoom &Out\tCtrl+-", ID_ZOOM_OUT), ("&Actual Size\tCtrl+0", ID_ZOOM_RESET)][..]),
+                ("&View", &[
+                    ("Zoom &In\tCtrl++", ID_ZOOM_IN), ("Zoom &Out\tCtrl+-", ID_ZOOM_OUT), ("&Actual Size\tCtrl+0", ID_ZOOM_RESET), ("", 0),
+                    ("&Dark Mode\tCtrl+D", ID_DARK), ("Dark Mode &Text Color...", ID_DARK_TEXT), ("Dark Mode &Background Color...", ID_DARK_BG), ("&Reset Dark Mode Colors", ID_DARK_RESET),
+                ][..]),
             ] {
-                AppendMenuW(bar, 0x0010, menu(items) as usize, wide(title).as_ptr()); // MF_POPUP
+                let m = menu(items);
+                if title == "&View" {
+                    VIEW_MENU.store(m, Ordering::Relaxed);
+                }
+                AppendMenuW(bar, 0x0010, m as usize, wide(title).as_ptr()); // MF_POPUP
             }
 
             // Default size: 1000 x 1150 at 100% scaling, fitted to the work area and centered.
@@ -690,9 +847,15 @@ mod win {
             SendMessageW(edit, EM_EXLIMITTEXT, 0, 0x7FFF_FFFF);
 
             let saved = load_settings();
-            if let Some((_, _, zoom)) = saved {
-                set_zoom(zoom);
+            if let Some(s) = &saved {
+                set_zoom(s.zoom);
+                DARK.store(s.dark, Ordering::Relaxed);
+                if let Some((fg, bg)) = s.colors {
+                    DARK_TEXT_COLOR.store(fg, Ordering::Relaxed);
+                    DARK_BG_COLOR.store(bg, Ordering::Relaxed);
+                }
             }
+            apply_theme(); // before the window shows, so dark mode doesn't flash white
             let mut argc = 0;
             let argv = CommandLineToArgvW(GetCommandLineW(), &mut argc);
             if !argv.is_null() && argc > 1 {
@@ -708,14 +871,14 @@ mod win {
             match saved {
                 // Windows moves a saved position that's now off-screen (say, a
                 // monitor was unplugged) back onto one.
-                Some((normal, max, _)) => {
+                Some(s) => {
                     let wp = WindowPlacement {
                         length: std::mem::size_of::<WindowPlacement>() as u32,
                         flags: 0,
-                        show_cmd: if max { 3 } else { 1 }, // SW_SHOWMAXIMIZED, SW_SHOWNORMAL
+                        show_cmd: if s.maximized { 3 } else { 1 }, // SW_SHOWMAXIMIZED, SW_SHOWNORMAL
                         min_pos: [-1, -1],
                         max_pos: [-1, -1],
-                        normal,
+                        normal: s.normal,
                     };
                     SetWindowPlacement(win, &wp);
                 }
@@ -738,6 +901,7 @@ mod win {
                 (ctrl, 0x6D, ID_ZOOM_OUT),   // numpad -
                 (ctrl, b'0' as u16, ID_ZOOM_RESET),
                 (ctrl, 0x60, ID_ZOOM_RESET), // numpad 0
+                (ctrl, b'D' as u16, ID_DARK),
             ];
             let accels: Vec<Accel> = keys.iter().map(|&(virt, key, cmd)| Accel { virt, key, cmd: cmd as u16 }).collect();
             let hacc = CreateAcceleratorTableW(accels.as_ptr(), accels.len() as i32);
