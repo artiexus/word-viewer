@@ -263,16 +263,26 @@ mod win {
     }
 
     #[repr(C)]
-    struct ChooseColor {
+    struct BitmapInfoHeader {
         size: u32,
-        owner: Hwnd,
-        instance: isize,
-        result: u32,
-        custom: *mut u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        x_ppm: i32,
+        y_ppm: i32,
+        clr_used: u32,
+        clr_important: u32,
+    }
+
+    #[repr(C)]
+    struct MonitorInfo {
+        size: u32,
+        monitor: Rect,
+        work: Rect,
         flags: u32,
-        cust_data: isize,
-        hook: *const c_void,
-        template_name: *const u16,
     }
 
     #[repr(C)]
@@ -409,6 +419,11 @@ mod win {
         fn BeginPaint(h: Hwnd, ps: *mut PaintStruct) -> isize;
         fn EndPaint(h: Hwnd, ps: *const PaintStruct) -> i32;
         fn MapWindowPoints(from: Hwnd, to: Hwnd, pts: *mut i32, n: u32) -> i32;
+        fn SetCapture(h: Hwnd) -> Hwnd;
+        fn ReleaseCapture() -> i32;
+        fn GetFocus() -> Hwnd;
+        fn MonitorFromWindow(h: Hwnd, flags: u32) -> isize;
+        fn GetMonitorInfoW(monitor: isize, mi: *mut MonitorInfo) -> i32;
     }
 
     #[link(name = "shell32")]
@@ -423,7 +438,6 @@ mod win {
         fn GetOpenFileNameW(ofn: *mut OpenFileName) -> i32;
         fn FindTextW(fr: *mut FindReplace) -> Hwnd;
         fn PrintDlgW(pd: *mut PrintDlg) -> i32;
-        fn ChooseColorW(cc: *mut ChooseColor) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -445,6 +459,14 @@ mod win {
         fn GetStockObject(i: i32) -> isize;
         fn RoundRect(dc: isize, l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> i32;
         fn GetObjectW(h: isize, n: i32, out: *mut c_void) -> i32;
+        fn SetBkColor(dc: isize, color: u32) -> u32;
+        fn CreateCompatibleDC(dc: isize) -> isize;
+        fn CreateCompatibleBitmap(dc: isize, w: i32, h: i32) -> isize;
+        fn BitBlt(dc: isize, x: i32, y: i32, w: i32, h: i32, src: isize, sx: i32, sy: i32, rop: u32) -> i32;
+        fn StretchDIBits(dc: isize, x: i32, y: i32, w: i32, h: i32, sx: i32, sy: i32, sw: i32, sh: i32,
+                         bits: *const c_void, bmi: *const c_void, usage: u32, rop: u32) -> i32;
+        fn CreateRoundRectRgn(l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> isize;
+        fn SelectClipRgn(dc: isize, rgn: isize) -> i32;
     }
 
     const WM_DESTROY: u32 = 0x0002;
@@ -616,7 +638,22 @@ mod win {
         fn face(&self) -> &'static str {
             FONTS[self.font].1[self.shown_weight()].unwrap_or(FONTS[self.font].0)
         }
+
+        /// The face for bold text, when Windows' bold of `face()` wouldn't
+        /// stand out enough: bold stays about as much heavier as it is
+        /// from Regular (Semibold's bold is Black, Light's is Bold).
+        fn bold_face(&self) -> Option<&'static str> {
+            BOLDER.iter().find(|b| b.0 == self.face()).map(|b| b.1)
+        }
     }
+
+    /// Faces whose bold text is shown in another face (which is then bolded).
+    const BOLDER: [(&str, &str); 4] = [
+        ("Segoe UI Light", "Segoe UI"),
+        ("Segoe UI Semilight", "Segoe UI"),
+        ("Segoe UI Semibold", "Segoe UI Black"),
+        ("Calibri Light", "Calibri"),
+    ];
 
     /// The current mode's text and background colors (either may be AUTO).
     fn colors() -> (u32, u32) {
@@ -742,42 +779,51 @@ mod win {
     static SHOWN_RTF: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
     /// `rtf` with the text preferences applied: font sizes scaled from the
-    /// default 11 pt, and the weight's face in the font table. Reads the RTF
-    /// this crate writes, where document text is escaped (\\, \{, \}), so
-    /// only real control words are changed.
+    /// default 11 pt, the weight's face in the font table, and bold text
+    /// in its own face if it needs one. Reads the RTF this crate writes,
+    /// where document text is escaped (\\, \{, \}), so only real control
+    /// words are changed.
     fn with_text_prefs(rtf: &str) -> String {
         let p = Prefs::current();
-        with_text_prefs_for(rtf, p.size, p.face())
+        with_text_prefs_for(rtf, p.size, p.face(), p.bold_face())
     }
 
-    fn with_text_prefs_for(rtf: &str, size: u32, face: &str) -> String {
+    fn with_text_prefs_for(rtf: &str, size: u32, face: &str, bold: Option<&str>) -> String {
         let mut out = String::with_capacity(rtf.len() + 64);
         let b = rtf.as_bytes();
         let mut i = 0;
         while i < b.len() {
-            if b[i] == b'\\' {
-                match b.get(i + 1) {
-                    Some(b'f') if b.get(i + 2) == Some(&b's') && b.get(i + 3).is_some_and(|c| c.is_ascii_digit()) => {
-                        let digits = b[i + 3..].iter().take_while(|c| c.is_ascii_digit()).count();
-                        let half_points: u32 = rtf[i + 3..i + 3 + digits].parse::<u32>().unwrap_or(22).min(3276);
+            if b[i] == b'\\' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+                // a control word: letters, then maybe a number
+                let name_end = i + 1 + b[i + 1..].iter().take_while(|c| c.is_ascii_alphabetic()).count();
+                let num_end = name_end + b[name_end..].iter().enumerate().take_while(|&(k, &c)| c.is_ascii_digit() || (k == 0 && c == b'-')).count();
+                let (name, num) = (&rtf[i + 1..name_end], &rtf[name_end..num_end]);
+                match name {
+                    "fs" if num.parse::<u32>().is_ok() => {
+                        let half_points = num.parse::<u32>().unwrap_or(22).min(3276);
                         out.push_str(&format!("\\fs{}", (half_points * size + DEFAULT_SIZE / 2) / DEFAULT_SIZE));
-                        i += 3 + digits;
-                        continue;
                     }
-                    Some(&c) => {
-                        // an escape (\\ \{ \}) or another control word: copy its first two bytes
-                        out.push('\\');
-                        out.push(c as char);
-                        i += 2;
-                        continue;
-                    }
-                    None => {}
+                    // bold on and off switch to the bold face and back
+                    "b" if bold.is_some() => out.push_str(if num == "0" { "\\b0\\f0" } else { "\\b\\f1" }),
+                    _ => out.push_str(&rtf[i..num_end]),
                 }
+                i = num_end;
+                continue;
+            }
+            if b[i] == b'\\' && i + 1 < b.len() {
+                // an escape (\\ \{ \}) or a control symbol: copy both bytes
+                out.push_str(&rtf[i..i + 2]);
+                i += 2;
+                continue;
             }
             out.push(b[i] as char); // RTF output is pure ASCII
             i += 1;
         }
-        out.replacen("{\\f0 Segoe UI;}", &format!("{{\\f0 {face};}}"), 1)
+        let table = match bold {
+            Some(bold) => format!("{{\\f0 {face};}}{{\\f1 {bold};}}"),
+            None => format!("{{\\f0 {face};}}"),
+        };
+        out.replacen("{\\f0 Segoe UI;}", &table, 1)
     }
 
     fn show_rtf(rtf: &str) {
@@ -1334,20 +1380,6 @@ mod win {
         r
     }
 
-    /// The standard color dialog, starting at `color`; the chosen color, if any.
-    fn choose_color(owner: Hwnd, color: u32) -> Option<u32> {
-        let mut custom = [0x00FF_FFFFu32; 16];
-        custom[0] = DARK_TEXT;
-        custom[1] = DARK_BG;
-        let mut cc: ChooseColor = unsafe { std::mem::zeroed() };
-        cc.size = std::mem::size_of::<ChooseColor>() as u32;
-        cc.owner = owner;
-        cc.result = color;
-        cc.custom = custom.as_mut_ptr();
-        cc.flags = 0x1 | 0x2; // CC_RGBINIT | CC_FULLOPEN
-        (unsafe { ChooseColorW(&mut cc) } != 0).then_some(cc.result & 0xFF_FFFF)
-    }
-
     // ---- View > Text Preferences ----
 
     /// The dialog's rows of choices: each row's first control id, and its
@@ -1440,8 +1472,7 @@ mod win {
         /// selections in Windows' accent color.
         fn new(dark: bool, (fg, bg): (u32, u32)) -> Palette {
             let accent = reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor").map_or(rgb(0x00, 0x67, 0xC0), |c| c & 0xFF_FFFF);
-            // black or white, whichever reads better on `c`
-            let on = |c: u32| if (c & 0xFF) * 299 + ((c >> 8) & 0xFF) * 587 + ((c >> 16) & 0xFF) * 114 > 150_000 { 0 } else { 0xFF_FFFF };
+            let on = ink_on;
             if dark {
                 let back = mix(bg, fg, 20);
                 let accent = mix(accent, 0xFF_FFFF, 100); // lighter, as Windows does on dark
@@ -1672,7 +1703,7 @@ mod win {
         let preview_dark = PREVIEW_DARK.get();
         SetWindowTextW(GetDlgItem(dlg, IDC_HEAD_PREVIEW as i32), wide(if preview_dark { "Preview: dark mode" } else { "Preview: light mode" }).as_ptr());
         let preview = GetDlgItem(dlg, IDC_PREVIEW as i32);
-        let mut rtf = with_text_prefs_for(SAMPLE, p.size, p.face()).into_bytes();
+        let mut rtf = with_text_prefs_for(SAMPLE, p.size, p.face(), p.bold_face()).into_bytes();
         rtf.push(0);
         let st = SetTextEx { flags: 0, codepage: 0 };
         SendMessageW(preview, EM_SETTEXTEX, &st as *const _ as usize, rtf.as_ptr() as isize);
@@ -1846,13 +1877,16 @@ mod win {
                         }
                     }
                     (IDC_LIGHT_FG | IDC_LIGHT_BG | IDC_DARK_FG | IDC_DARK_BG, _) if click => {
-                        let dark = id == IDC_DARK_FG || id == IDC_DARK_BG;
-                        let colors = if dark { &mut p.dark } else { &mut p.light };
-                        let (slot, system) = if id == IDC_LIGHT_FG || id == IDC_DARK_FG { (&mut colors.0, 8) } else { (&mut colors.1, 5) };
-                        if let Some(c) = choose_color(dlg, resolve(*slot, system)) {
-                            *slot = c;
+                        // preview that mode while picking (the picker shows
+                        // its color there as it changes), then the result
+                        PREVIEW_DARK.set(slot_dark(id));
+                        sync(dlg);
+                        if let Some(c) = pick_color(dlg, id) {
+                            *slot_of(&mut p, id) = c;
                         }
-                        PREVIEW_DARK.set(dark);
+                        PENDING.set(p);
+                        sync(dlg);
+                        return 1;
                     }
                     (IDC_RESTORE, _) if click => {
                         p = Prefs::DEFAULT;
@@ -1867,6 +1901,497 @@ mod win {
                 PENDING.set(p);
                 if p != old || PREVIEW_DARK.get() != old_preview {
                     sync(dlg);
+                }
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    // ---- the color picker (Text color... and Background...) ----
+
+    const PICK_FIELD: u16 = 401;
+    const PICK_HUE: u16 = 402;
+    const PICK_COMPARE: u16 = 403;
+    const PICK_SAMPLE: u16 = 404;
+    const PICK_CONTRAST: u16 = 405;
+    const PICK_HEX: u16 = 410;
+    const PICK_SWATCH: u16 = 420;
+    const SWATCHES: usize = 8;
+
+    /// Colors suggested for each of the four colors.
+    const LIGHT_TEXTS: [u32; SWATCHES] = [
+        rgb(0x00, 0x00, 0x00), rgb(0x1B, 0x1B, 0x1B), rgb(0x26, 0x26, 0x26), rgb(0x44, 0x44, 0x44),
+        rgb(0x5B, 0x46, 0x36), rgb(0x1F, 0x3A, 0x5F), rgb(0x2E, 0x4A, 0x2E), rgb(0x5A, 0x2E, 0x2E),
+    ];
+    const LIGHT_BACKS: [u32; SWATCHES] = [
+        rgb(0xFF, 0xFF, 0xFF), rgb(0xFA, 0xF7, 0xF0), rgb(0xF4, 0xEC, 0xD8), rgb(0xE3, 0xE3, 0xE3),
+        rgb(0xFF, 0xF8, 0xE1), rgb(0xEA, 0xF2, 0xE3), rgb(0xE8, 0xEE, 0xF6), rgb(0xF6, 0xEA, 0xEA),
+    ];
+    const DARK_TEXTS: [u32; SWATCHES] = [
+        rgb(0xFF, 0xFF, 0xFF), rgb(0xE6, 0xE6, 0xE6), DARK_TEXT, rgb(0xA6, 0xA6, 0xA6),
+        rgb(0xE3, 0xD5, 0xBC), rgb(0xC9, 0xD1, 0xD9), rgb(0xFF, 0xC8, 0x00), rgb(0x7E, 0xE7, 0x87),
+    ];
+    const DARK_BACKS: [u32; SWATCHES] = [
+        rgb(0x00, 0x00, 0x00), DARK_BG, rgb(0x1E, 0x1E, 0x1E), rgb(0x2B, 0x2B, 0x2B),
+        rgb(0x0D, 0x11, 0x17), rgb(0x1F, 0x1B, 0x16), rgb(0x0F, 0x1F, 0x17), rgb(0x1A, 0x1A, 0x2E),
+    ];
+
+    /// Whether a color button is dark mode's, and whether it's for text.
+    fn slot_dark(id: u16) -> bool {
+        id == IDC_DARK_FG || id == IDC_DARK_BG
+    }
+
+    fn slot_text(id: u16) -> bool {
+        id == IDC_LIGHT_FG || id == IDC_DARK_FG
+    }
+
+    fn slot_of(p: &mut Prefs, id: u16) -> &mut u32 {
+        let colors = if slot_dark(id) { &mut p.dark } else { &mut p.light };
+        if slot_text(id) { &mut colors.0 } else { &mut colors.1 }
+    }
+
+    /// Black or white, whichever reads better on `c`.
+    fn ink_on(c: u32) -> u32 {
+        if (c & 0xFF) * 299 + ((c >> 8) & 0xFF) * 587 + ((c >> 16) & 0xFF) * 114 > 150_000 { 0 } else { 0xFF_FFFF }
+    }
+
+    /// Hue (degrees), saturation and value (0 to 1) to a COLORREF.
+    fn hsv_to_rgb((h, s, v): (f64, f64, f64)) -> u32 {
+        let c = v * s;
+        let hp = (h / 60.0).rem_euclid(6.0);
+        let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+        let (r, g, b) = match hp as u32 {
+            0 => (c, x, 0.0),
+            1 => (x, c, 0.0),
+            2 => (0.0, c, x),
+            3 => (0.0, x, c),
+            4 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        let m = v - c;
+        let ch = |t: f64| ((t + m) * 255.0).round().clamp(0.0, 255.0) as u32;
+        rgb(ch(r), ch(g), ch(b))
+    }
+
+    /// A COLORREF to hue, saturation and value; grays keep `hue`.
+    fn rgb_to_hsv(c: u32, hue: f64) -> (f64, f64, f64) {
+        let [r, g, b] = [c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF].map(|v| v as f64 / 255.0);
+        let max = r.max(g).max(b);
+        let d = max - r.min(g).min(b);
+        let h = if d == 0.0 {
+            hue
+        } else if max == r {
+            60.0 * ((g - b) / d).rem_euclid(6.0)
+        } else if max == g {
+            60.0 * ((b - r) / d + 2.0)
+        } else {
+            60.0 * ((r - g) / d + 4.0)
+        };
+        (h, if max == 0.0 { 0.0 } else { d / max }, max)
+    }
+
+    /// "#RRGGBB"
+    fn hex(c: u32) -> String {
+        format!("#{:02X}{:02X}{:02X}", c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF)
+    }
+
+    /// "#RRGGBB", "RRGGBB", or the short "#RGB".
+    fn parse_hex(s: &str) -> Option<u32> {
+        let s = s.trim();
+        let s = s.strip_prefix('#').unwrap_or(s);
+        if !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(s, 16).ok()?;
+        match s.len() {
+            6 => Some(rgb(v >> 16, (v >> 8) & 0xFF, v & 0xFF)),
+            3 => Some(rgb((v >> 8) * 17, ((v >> 4) & 0xF) * 17, (v & 0xF) * 17)),
+            _ => None,
+        }
+    }
+
+    /// The WCAG contrast ratio of two colors (1 to 21).
+    fn contrast(a: u32, b: u32) -> f64 {
+        let lum = |c: u32| {
+            let lin = |v: u32| {
+                let v = v as f64 / 255.0;
+                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * lin(c & 0xFF) + 0.7152 * lin((c >> 8) & 0xFF) + 0.0722 * lin((c >> 16) & 0xFF)
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// The picker's state.
+    #[derive(Clone, Copy)]
+    struct Pick {
+        hsv: (f64, f64, f64),
+        /// The color it started with, and the one it goes with (the
+        /// background for a text color, and the other way around).
+        start: u32,
+        other: u32,
+        /// Which color button opened it, in which dialog.
+        slot: u16,
+        prefs: Hwnd,
+        /// Dragging in the field (1) or the hue bar (2).
+        drag: u8,
+        /// Setting the hex box's text, not the user typing.
+        quiet: bool,
+        back: isize,
+        field: isize,
+    }
+
+    impl Pick {
+        const NONE: Pick = Pick { hsv: (0.0, 0.0, 0.0), start: 0, other: 0, slot: 0, prefs: 0, drag: 0, quiet: false, back: 0, field: 0 };
+
+        fn color(&self) -> u32 {
+            hsv_to_rgb(self.hsv)
+        }
+
+        fn suggestions(&self) -> &'static [u32; SWATCHES] {
+            match (slot_dark(self.slot), slot_text(self.slot)) {
+                (false, true) => &LIGHT_TEXTS,
+                (false, false) => &LIGHT_BACKS,
+                (true, true) => &DARK_TEXTS,
+                (true, false) => &DARK_BACKS,
+            }
+        }
+    }
+
+    thread_local! {
+        static PICK: std::cell::Cell<Pick> = const { std::cell::Cell::new(Pick::NONE) };
+    }
+
+    /// Pick a color for one of the Text Preferences color buttons; the
+    /// preview there shows it as it changes.
+    unsafe fn pick_color(prefs: Hwnd, slot: u16) -> Option<u32> {
+        let p = PENDING.get();
+        let (fg, bg) = if slot_dark(slot) { p.dark } else { p.light };
+        let (fg, bg) = (resolve(fg, 8), resolve(bg, 5));
+        let (start, other) = if slot_text(slot) { (fg, bg) } else { (bg, fg) };
+        let pal = PALETTE.get();
+        PICK.set(Pick { hsv: rgb_to_hsv(start, 0.0), start, other, slot, prefs, back: CreateSolidBrush(pal.back), field: CreateSolidBrush(pal.chip), ..Pick::NONE });
+        let title = format!("{} mode {} color", if slot_dark(slot) { "Dark" } else { "Light" }, if slot_text(slot) { "text" } else { "background" });
+        let mut t = Template::new(&title, 290, 198);
+        const OWNER_DRAWN: u32 = 0xD; // SS_OWNERDRAW (and no SS_NOTIFY: clicks go to the dialog)
+        t.item(STATIC, OWNER_DRAWN, [8, 8, 154, 128], PICK_FIELD, "");
+        t.item(STATIC, OWNER_DRAWN, [164, 8, 18, 128], PICK_HUE, "");
+        t.item(STATIC, OWNER_DRAWN, [190, 10, 90, 40], PICK_COMPARE, "");
+        t.item(STATIC, LABEL | GROUP, [190, 58, 22, 14], NONE, "He&x");
+        t.item(0x81, 0x80 | GROUP | TAB, [218, 60, 60, 10], PICK_HEX, ""); // EDIT, ES_AUTOHSCROLL
+        t.item(STATIC, OWNER_DRAWN, [190, 80, 90, 30], PICK_SAMPLE, "");
+        t.item(STATIC, OWNER_DRAWN, [190, 114, 92, 24], PICK_CONTRAST, "");
+        t.item(STATIC, GROUP, [10, 142, 180, 10], NONE, "&Suggestions");
+        for i in 0..SWATCHES {
+            let first = if i == 0 { GROUP | TAB } else { 0 };
+            t.item(BUTTON, CHIP | first, [8 + i as i16 * 24, 154, 24, 18], PICK_SWATCH + i as u16, "");
+        }
+        t.item(BUTTON, CHIP | GROUP | TAB, [166, 178, 56, 14], 1, "OK");
+        t.item(BUTTON, CHIP | TAB, [226, 178, 56, 14], 2, "Cancel");
+        let words = t.finish();
+        let ok = DialogBoxIndirectParamW(GetModuleHandleW(null()), words.as_ptr() as *const c_void, prefs, pick_proc, 0) == 1;
+        let k = PICK.replace(Pick::NONE);
+        DeleteObject(k.back);
+        DeleteObject(k.field);
+        ok.then(|| k.color())
+    }
+
+    /// `r` shrunk by `dx` and `dy` on each side.
+    fn deflate(r: Rect, dx: i32, dy: i32) -> Rect {
+        Rect { left: r.left + dx, top: r.top + dy, right: r.right - dx, bottom: r.bottom - dy }
+    }
+
+    /// Where the field's colors are, inside its control (room left for the marker).
+    fn field_area(r: Rect) -> Rect {
+        deflate(r, scaled(8), scaled(8))
+    }
+
+    fn hue_area(r: Rect) -> Rect {
+        deflate(r, scaled(4), scaled(8))
+    }
+
+    /// Show a new color: everywhere in the picker, and in the preview
+    /// behind it. `typed`: it came from the hex box, so leave that as is.
+    unsafe fn set_pick(dlg: Hwnd, hsv: (f64, f64, f64), typed: bool) {
+        let mut k = PICK.get();
+        k.hsv = hsv;
+        PICK.set(k);
+        let c = k.color();
+        if !typed {
+            set_hex(dlg, c);
+        }
+        let ids = [PICK_FIELD, PICK_HUE, PICK_COMPARE, PICK_SAMPLE, PICK_CONTRAST].into_iter().chain((0..SWATCHES as u16).map(|i| PICK_SWATCH + i));
+        for id in ids {
+            RedrawWindow(GetDlgItem(dlg, id as i32), null(), 0, 0x1 | 0x100); // RDW_INVALIDATE | RDW_UPDATENOW
+        }
+        // the Text Preferences preview, and the button's swatch
+        let mut p = PENDING.get();
+        *slot_of(&mut p, k.slot) = c;
+        PENDING.set(p);
+        set_colors(GetDlgItem(k.prefs, IDC_PREVIEW as i32), if slot_dark(k.slot) { p.dark } else { p.light });
+        let pad = scaled(6);
+        let card = deflate(control_rect(k.prefs, IDC_PREVIEW), -pad, -pad);
+        RedrawWindow(k.prefs, &card, 0, 0x1 | 0x80 | 0x100); // and RDW_ALLCHILDREN
+        RedrawWindow(GetDlgItem(k.prefs, k.slot as i32), null(), 0, 0x1 | 0x100);
+    }
+
+    unsafe fn set_hex(dlg: Hwnd, c: u32) {
+        let mut k = PICK.get();
+        k.quiet = true;
+        PICK.set(k);
+        SetWindowTextW(GetDlgItem(dlg, PICK_HEX as i32), wide(&hex(c)).as_ptr());
+        k.quiet = false;
+        PICK.set(k);
+    }
+
+    /// Pick from where the mouse is in the field or the hue bar.
+    unsafe fn pick_at(dlg: Hwnd, x: i32, y: i32) {
+        let k = PICK.get();
+        let frac = |v: i32, lo: i32, hi: i32| ((v - lo) as f64 / (hi - lo - 1).max(1) as f64).clamp(0.0, 1.0);
+        match k.drag {
+            1 => {
+                let r = field_area(control_rect(dlg, PICK_FIELD));
+                set_pick(dlg, (k.hsv.0, frac(x, r.left, r.right), 1.0 - frac(y, r.top, r.bottom)), false);
+            }
+            2 => {
+                let r = hue_area(control_rect(dlg, PICK_HUE));
+                set_pick(dlg, (frac(y, r.top, r.bottom) * 360.0, k.hsv.1, k.hsv.2), false);
+            }
+            _ => {}
+        }
+    }
+
+    /// Draw into a bitmap the size of an owner-drawn control, then show it
+    /// all at once (no flicker while dragging).
+    unsafe fn buffered(d: &DrawItem, back: u32, font: isize, draw: impl FnOnce(isize, Rect)) {
+        let (w, h) = (d.rc.right - d.rc.left, d.rc.bottom - d.rc.top);
+        let mem = CreateCompatibleDC(d.dc);
+        let bmp = CreateCompatibleBitmap(d.dc, w, h);
+        let old_bmp = SelectObject(mem, bmp);
+        let old_font = SelectObject(mem, font);
+        let r = Rect { left: 0, top: 0, right: w, bottom: h };
+        fill(mem, &r, back);
+        SetBkMode(mem, 1); // TRANSPARENT
+        draw(mem, r);
+        BitBlt(d.dc, d.rc.left, d.rc.top, w, h, mem, 0, 0, 0x00CC_0020); // SRCCOPY
+        SelectObject(mem, old_font);
+        SelectObject(mem, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+    }
+
+    /// Pixels (COLORREFs, `w` by `h`) into `r`, stretched to fit, clipped to rounded corners.
+    unsafe fn blit(dc: isize, r: &Rect, w: i32, h: i32, px: &[u32], radius: i32) {
+        // DIBs are 0x00RRGGBB
+        let px: Vec<u32> = px.iter().map(|&c| (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16) & 0xFF).collect();
+        let bmi = BitmapInfoHeader { size: 40, width: w, height: -h, planes: 1, bit_count: 32, compression: 0, size_image: 0, x_ppm: 0, y_ppm: 0, clr_used: 0, clr_important: 0 };
+        let rgn = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
+        SelectClipRgn(dc, rgn);
+        StretchDIBits(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, 0, 0, w, h, px.as_ptr() as *const c_void, &bmi as *const _ as *const c_void, 0, 0x00CC_0020);
+        SelectClipRgn(dc, 0);
+        DeleteObject(rgn);
+    }
+
+    /// A marker that shows on any color: white, with a dark edge.
+    unsafe fn marker(dc: isize, r: Rect, fill_color: Option<u32>, radius: i32) {
+        round_rect(dc, &deflate(r, -1, -1), None, Some((rgb(0x40, 0x40, 0x40), 1)), radius + 2);
+        round_rect(dc, &r, fill_color, Some((0xFF_FFFF, scaled(2))), radius);
+    }
+
+    unsafe fn draw_pick(dlg: Hwnd, d: &DrawItem) {
+        const FOCUS: u32 = 0x10;
+        const NOFOCUSRECT: u32 = 0x200;
+        let (pal, k) = (PALETTE.get(), PICK.get());
+        let c = k.color();
+        let font = SendMessageW(dlg, 0x0031, 0, 0); // WM_GETFONT
+        let radius = scaled(8);
+        let id = d.ctl_id as u16;
+        match id {
+            PICK_FIELD => buffered(d, pal.back, font, |dc, r| {
+                // saturation across, value (brightness) down, at this hue
+                let a = field_area(r);
+                let (w, h) = (a.right - a.left, a.bottom - a.top);
+                let step = |n: i32, i: i32| i as f64 / (n - 1).max(1) as f64;
+                let px: Vec<u32> = (0..h).flat_map(|y| (0..w).map(move |x| hsv_to_rgb((k.hsv.0, step(w, x), 1.0 - step(h, y))))).collect();
+                blit(dc, &a, w, h, &px, radius);
+                round_rect(dc, &a, None, Some((pal.edge, 1)), radius);
+                let (x, y) = (a.left + (k.hsv.1 * (w - 1) as f64).round() as i32, a.top + ((1.0 - k.hsv.2) * (h - 1) as f64).round() as i32);
+                let m = scaled(7);
+                marker(dc, Rect { left: x - m, top: y - m, right: x + m, bottom: y + m }, Some(c), 2 * m);
+            }),
+            PICK_HUE => buffered(d, pal.back, font, |dc, r| {
+                let a = hue_area(r);
+                let h = a.bottom - a.top;
+                let px: Vec<u32> = (0..h).map(|y| hsv_to_rgb((y as f64 * 360.0 / (h - 1).max(1) as f64, 1.0, 1.0))).collect();
+                blit(dc, &a, 1, h, &px, radius);
+                round_rect(dc, &a, None, Some((pal.edge, 1)), radius);
+                let y = a.top + (k.hsv.0 / 360.0 * (h - 1) as f64).round() as i32;
+                let t = scaled(4);
+                marker(dc, Rect { left: r.left + 1, top: y - t, right: r.right - 1, bottom: y + t }, Some(hsv_to_rgb((k.hsv.0, 1.0, 1.0))), 2 * t);
+            }),
+            PICK_COMPARE => buffered(d, pal.back, font, |dc, r| {
+                // the new color over the one it started with (click that to go back)
+                let mid = r.bottom / 2;
+                let rgn = CreateRoundRectRgn(0, 0, r.right + 1, r.bottom + 1, radius, radius);
+                SelectClipRgn(dc, rgn);
+                fill(dc, &Rect { bottom: mid, ..r }, c);
+                fill(dc, &Rect { top: mid, ..r }, k.start);
+                SelectClipRgn(dc, 0);
+                DeleteObject(rgn);
+                round_rect(dc, &r, None, Some((pal.edge, 1)), radius);
+                for (text, color, rc) in [("New", c, Rect { bottom: mid, ..r }), ("Current", k.start, Rect { top: mid, ..r })] {
+                    SetTextColor(dc, ink_on(color));
+                    draw_text(dc, &text.encode_utf16().collect::<Vec<_>>(), &mut rc.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+            }),
+            PICK_SAMPLE => buffered(d, pal.back, font, |dc, r| {
+                let (fg, bg) = if slot_text(k.slot) { (c, k.other) } else { (k.other, c) };
+                round_rect(dc, &r, Some(bg), Some((pal.edge, 1)), radius);
+                let p = PENDING.get();
+                let face = font_like(font, Some(p.face()), 0);
+                let old = SelectObject(dc, if face != 0 { face } else { font });
+                SetTextColor(dc, fg);
+                draw_text(dc, &"Sample text".encode_utf16().collect::<Vec<_>>(), &mut r.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(dc, old);
+                if face != 0 {
+                    DeleteObject(face);
+                }
+            }),
+            PICK_CONTRAST => buffered(d, pal.back, font, |dc, r| {
+                let ratio = contrast(c, k.other);
+                let verdict = match ratio {
+                    x if x >= 7.0 => "very easy to read",
+                    x if x >= 4.5 => "easy to read",
+                    x if x >= 3.0 => "readable, if large",
+                    _ => "hard to read",
+                };
+                SetTextColor(dc, pal.dim);
+                let text = format!("Contrast {ratio:.1} : 1\n{verdict}");
+                draw_text(dc, &text.encode_utf16().collect::<Vec<_>>(), &mut r.clone(), 0x10); // DT_WORDBREAK
+            }),
+            _ if (PICK_SWATCH..PICK_SWATCH + SWATCHES as u16).contains(&id) => buffered(d, pal.back, font, |dc, r| {
+                let s = k.suggestions()[(id - PICK_SWATCH) as usize];
+                let edge = if s == c { (pal.accent, scaled(2)) } else { (pal.edge, 1) };
+                round_rect(dc, &deflate(r, scaled(3), scaled(3)), Some(s), Some(edge), scaled(6));
+                if d.state & FOCUS != 0 && d.state & NOFOCUSRECT == 0 {
+                    round_rect(dc, &r, None, Some((pal.text, 1)), scaled(8));
+                }
+            }),
+            _ => draw_chip(dlg, d),
+        }
+    }
+
+    unsafe extern "system" fn pick_proc(dlg: Hwnd, m: u32, w: usize, l: isize) -> isize {
+        let item = |id: u16| GetDlgItem(dlg, id as i32);
+        let hex_field = || deflate(control_rect(dlg, PICK_HEX), -scaled(7), -scaled(5));
+        let pt = || ((l & 0xFFFF) as i16 as i32, ((l >> 16) & 0xFFFF) as i16 as i32);
+        let inside = |r: Rect, (x, y): (i32, i32)| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+        match m {
+            0x0110 => { // WM_INITDIALOG
+                dark_title(dlg, DLG_DARK.get().unwrap_or(false));
+                // beside the preview, so it shows the color as it changes
+                let (mut me, mut card) = (Rect::default(), control_rect(PICK.get().prefs, IDC_PREVIEW));
+                GetWindowRect(dlg, &mut me);
+                MapWindowPoints(PICK.get().prefs, 0, &mut card as *mut Rect as *mut i32, 2);
+                let mut mi = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, monitor: Rect::default(), work: Rect::default(), flags: 0 };
+                if GetMonitorInfoW(MonitorFromWindow(PICK.get().prefs, 2), &mut mi) != 0 { // MONITOR_DEFAULTTONEAREST
+                    let (w, h) = (me.right - me.left, me.bottom - me.top);
+                    let x = (card.left - scaled(20) - w).clamp(mi.work.left, (mi.work.right - w).max(mi.work.left));
+                    let y = ((card.top + card.bottom - h) / 2).clamp(mi.work.top, (mi.work.bottom - h).max(mi.work.top));
+                    SetWindowPos(dlg, 0, x, y, 0, 0, 0x1 | 0x4 | 0x10); // SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                }
+                SendMessageW(item(PICK_HEX), 0x00C5, 7, 0); // EM_LIMITTEXT
+                set_hex(dlg, PICK.get().color());
+                SetFocus(item(PICK_HEX));
+                SendMessageW(item(PICK_HEX), EM_SETSEL, 0, -1);
+                0 // the focus is set
+            }
+            0x0133 => { // WM_CTLCOLOREDIT
+                let pal = PALETTE.get();
+                SetTextColor(w as isize, pal.text);
+                SetBkColor(w as isize, pal.chip);
+                PICK.get().field
+            }
+            0x0135 | 0x0136 | 0x0138 => { // WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC
+                SetTextColor(w as isize, PALETTE.get().text);
+                SetBkMode(w as isize, 1); // TRANSPARENT
+                PICK.get().back
+            }
+            0x002B => { // WM_DRAWITEM
+                draw_pick(dlg, &*(l as *const DrawItem));
+                1
+            }
+            0x000F => { // WM_PAINT: the hex box's rounded field
+                let mut ps: PaintStruct = std::mem::zeroed();
+                let dc = BeginPaint(dlg, &mut ps);
+                let pal = PALETTE.get();
+                let edge = if GetFocus() == item(PICK_HEX) { (pal.accent, scaled(2)) } else { (pal.edge, 1) };
+                round_rect(dc, &hex_field(), Some(pal.chip), Some(edge), scaled(8));
+                EndPaint(dlg, &ps);
+                1
+            }
+            0x0201 => { // WM_LBUTTONDOWN
+                let mut k = PICK.get();
+                let at = pt();
+                if inside(control_rect(dlg, PICK_FIELD), at) {
+                    k.drag = 1;
+                } else if inside(control_rect(dlg, PICK_HUE), at) {
+                    k.drag = 2;
+                } else {
+                    let r = control_rect(dlg, PICK_COMPARE);
+                    if inside(Rect { top: (r.top + r.bottom) / 2, ..r }, at) {
+                        set_pick(dlg, rgb_to_hsv(k.start, k.hsv.0), false); // back to the current color
+                    }
+                    return 1;
+                }
+                PICK.set(k);
+                SetCapture(dlg);
+                pick_at(dlg, at.0, at.1);
+                1
+            }
+            0x0200 if PICK.get().drag != 0 => { // WM_MOUSEMOVE
+                let (x, y) = pt();
+                pick_at(dlg, x, y);
+                1
+            }
+            0x0202 | 0x0215 => { // WM_LBUTTONUP, WM_CAPTURECHANGED
+                let mut k = PICK.get();
+                if k.drag != 0 {
+                    k.drag = 0;
+                    PICK.set(k);
+                    if m == 0x0202 {
+                        ReleaseCapture();
+                    }
+                }
+                1
+            }
+            WM_COMMAND => {
+                let (id, code) = ((w & 0xFFFF) as u16, ((w >> 16) & 0xFFFF) as u16);
+                let k = PICK.get();
+                match (id, code) {
+                    (PICK_HEX, 0x0300) if !k.quiet => { // EN_CHANGE: typed
+                        let mut buf = [0u16; 16];
+                        let n = GetWindowTextW(item(PICK_HEX), buf.as_mut_ptr(), 16).clamp(0, 15) as usize;
+                        if let Some(c) = parse_hex(&String::from_utf16_lossy(&buf[..n])) {
+                            set_pick(dlg, rgb_to_hsv(c, k.hsv.0), true);
+                        }
+                    }
+                    (PICK_HEX, 0x0100 | 0x0200) => { // EN_SETFOCUS, EN_KILLFOCUS
+                        if code == 0x0200 {
+                            set_hex(dlg, k.color()); // tidy what was typed
+                        }
+                        RedrawWindow(dlg, &deflate(hex_field(), -2, -2), 0, 0x1 | 0x4); // RDW_INVALIDATE | RDW_ERASE
+                    }
+                    (1 | 2, 0 | 5) => {
+                        EndDialog(dlg, (id == 1) as isize); // OK, Cancel
+                    }
+                    (_, 0 | 5) if (PICK_SWATCH..PICK_SWATCH + SWATCHES as u16).contains(&id) => {
+                        let s = k.suggestions()[(id - PICK_SWATCH) as usize];
+                        set_pick(dlg, rgb_to_hsv(s, k.hsv.0), false);
+                    }
+                    _ => return 0,
                 }
                 1
             }
@@ -2237,11 +2762,32 @@ mod win {
             TEXT_SIZE.store(22, Ordering::Relaxed); // twice the default 11 pt
             TEXT_WEIGHT.store(3, Ordering::Relaxed); // Semibold
             // a heading, then document text that looks like RTF (escaped by the library)
-            let rtf = r"{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI;}}\fs22 {\b\fs40 Title}\par \\fs22 \{\\fs40\} \fi-360 x}";
-            assert_eq!(with_text_prefs(rtf), r"{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI Semibold;}}\fs44 {\b\fs80 Title}\par \\fs22 \{\\fs40\} \fi-360 x}");
+            let rtf = r"{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI;}}\fs22 {\b\fs40 Title}\par \\fs22 \{\\fs40\} \fi-360 x \b y\b0 z\bullet\brdrw10 \\b \'e9}";
+            // bold text in Segoe UI Black, so it stands out from Semibold
+            assert_eq!(
+                with_text_prefs(rtf),
+                r"{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI Semibold;}{\f1 Segoe UI Black;}}\fs44 {\b\f1\fs80 Title}\par \\fs22 \{\\fs40\} \fi-360 x \b\f1 y\b0\f0 z\bullet\brdrw10 \\b \'e9}"
+            );
             TEXT_SIZE.store(DEFAULT_SIZE, Ordering::Relaxed);
             TEXT_WEIGHT.store(DEFAULT_WEIGHT, Ordering::Relaxed);
             assert_eq!(with_text_prefs(rtf), rtf);
+        }
+
+        #[test]
+        fn picker_colors_round_trip() {
+            // every color the picker shows comes back exactly (a sample of them)
+            for c in (0..0x100_0000u32).step_by(997).chain([0, 0xFF_FFFF, rgb(255, 200, 0), rgb(1, 0, 0)]) {
+                assert_eq!(hsv_to_rgb(rgb_to_hsv(c, 0.0)), c, "{}", hex(c));
+            }
+            assert_eq!(rgb_to_hsv(rgb(128, 128, 128), 200.0).0, 200.0); // grays keep the hue
+            assert_eq!(hex(rgb(0xFF, 0xC8, 0x00)), "#FFC800");
+            assert_eq!(parse_hex("#ffc800"), Some(rgb(0xFF, 0xC8, 0x00)));
+            assert_eq!(parse_hex(" fc0 "), Some(rgb(0xFF, 0xCC, 0x00)));
+            for bad in ["", "#", "#12345", "+12345", "#GG0000", "#1234567"] {
+                assert_eq!(parse_hex(bad), None, "{bad}");
+            }
+            assert!((contrast(0, 0xFF_FFFF) - 21.0).abs() < 1e-9);
+            assert!((contrast(DARK_TEXT, DARK_BG) - 12.2).abs() < 0.05);
         }
     }
 }
