@@ -15,7 +15,7 @@ Download `word-viewer.exe` from [Releases](../../releases), then open a document
 - Zoom: Ctrl+Plus, Ctrl+Minus, Ctrl+0 (or Ctrl+mouse wheel)
 - Print: Ctrl+P
 - Dark mode: follows Windows' app mode until you choose; Ctrl+D switches it
-- View → Text Preferences: text size and weight, and dark mode (match Windows, always light or always dark) with its text and background colors
+- View → Text Preferences: font, size and weight; line spacing, and a line length limit for wide windows; light or dark mode (or match Windows), each with color schemes (such as sepia) or your own colors; with a live preview
 
 The window remembers its size, position, zoom, text preferences and dark mode in `%LOCALAPPDATA%\word-viewer\window.txt`; nothing about the documents you open is stored.
 
