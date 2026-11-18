@@ -14,6 +14,7 @@ mod epub;
 mod inflate;
 pub use inflate::inflate;
 mod markup;
+mod numbers;
 mod odt;
 mod pdf;
 pub use pdf::PdfError;
@@ -30,6 +31,8 @@ pub const MAX_FILE: usize = 64 << 20;
 pub const MAX_PDF: usize = 1 << 30;
 /// Largest uncompressed word/document.xml accepted.
 const MAX_XML: usize = 64 << 20;
+/// Largest uncompressed word/styles.xml or word/numbering.xml accepted.
+const MAX_PART: usize = 16 << 20;
 
 const CFB_MAGIC: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
 
@@ -42,7 +45,10 @@ pub fn to_rtf(data: &[u8]) -> Option<String> {
         doc::render(data)
     } else {
         let xml = zip::extract(data, "word/document.xml", MAX_XML)?;
-        Some(docx::render(&xml))
+        // optional: without them, headings go by English style names and lists show bullets
+        let styles = zip::extract(data, "word/styles.xml", MAX_PART).unwrap_or_default();
+        let numbering = zip::extract(data, "word/numbering.xml", MAX_PART).unwrap_or_default();
+        Some(docx::render(&xml, &styles, &numbering))
     }
 }
 
