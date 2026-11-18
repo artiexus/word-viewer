@@ -1701,7 +1701,14 @@ mod win {
         }
         SetWindowTextW(GetDlgItem(dlg, IDC_SIZE as i32), wide(&format!("{} pt", p.size)).as_ptr());
         let preview_dark = PREVIEW_DARK.get();
-        SetWindowTextW(GetDlgItem(dlg, IDC_HEAD_PREVIEW as i32), wide(if preview_dark { "Preview: dark mode" } else { "Preview: light mode" }).as_ptr());
+        let head = match (preview_dark, preview_dark == dark) {
+            (true, true) => "Preview: dark mode",
+            (false, true) => "Preview: light mode",
+            // only while picking the other mode's color
+            (true, false) => "Preview: dark mode colors (while picking)",
+            (false, false) => "Preview: light mode colors (while picking)",
+        };
+        SetWindowTextW(GetDlgItem(dlg, IDC_HEAD_PREVIEW as i32), wide(head).as_ptr());
         let preview = GetDlgItem(dlg, IDC_PREVIEW as i32);
         let mut rtf = with_text_prefs_for(SAMPLE, p.size, p.face(), p.bold_face()).into_bytes();
         rtf.push(0);
@@ -1859,13 +1866,10 @@ mod win {
                     // a choice is chosen by clicking it, or (except color
                     // schemes) by moving to it with the arrow keys: BN_SETFOCUS
                     (_, Some((g, i))) if click || (code == 6 && g != G_LIGHT && g != G_DARK) => {
+                        // the preview stays in the mode chosen, even when the
+                        // other mode's colors change
                         p.choose(g, i);
-                        match g {
-                            G_MODE => PREVIEW_DARK.set(p.dark()),
-                            G_LIGHT => PREVIEW_DARK.set(false),
-                            G_DARK => PREVIEW_DARK.set(true),
-                            _ => {}
-                        }
+                        PREVIEW_DARK.set(p.dark());
                     }
                     (IDC_SMALLER | IDC_LARGER, _) if click => {
                         let next = if id == IDC_LARGER { SIZES.iter().find(|&&s| s > p.size) } else { SIZES.iter().rev().find(|&&s| s < p.size) };
@@ -1877,14 +1881,16 @@ mod win {
                         }
                     }
                     (IDC_LIGHT_FG | IDC_LIGHT_BG | IDC_DARK_FG | IDC_DARK_BG, _) if click => {
-                        // preview that mode while picking (the picker shows
-                        // its color there as it changes), then the result
+                        // preview the color's mode only while picking (the
+                        // picker shows its color there as it changes), then
+                        // the mode chosen again
                         PREVIEW_DARK.set(slot_dark(id));
                         sync(dlg);
                         if let Some(c) = pick_color(dlg, id) {
                             *slot_of(&mut p, id) = c;
                         }
                         PENDING.set(p);
+                        PREVIEW_DARK.set(p.dark());
                         sync(dlg);
                         return 1;
                     }
